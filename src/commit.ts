@@ -1,0 +1,361 @@
+/**
+ * The commit trigger: build the diff for the commit Claude just made, run the
+ * org's detections against it in Amplify, and wake Claude with the findings.
+ *
+ * Every early exit is code 0 ("nothing to report"). Only a completed run with
+ * in-scope findings exits 2, after emitting the model-visible context.
+ */
+import { AGENT_NAME, AmplifyApi, ApiError, TERMINAL_STATUSES, type Run } from "./amplify-api.ts"
+import { type Config, describeMissingConfig, isDryRun, loadConfig } from "./config.ts"
+import { filterToScope, formatContext, formatSummary, inScope, parseFinding } from "./findings.ts"
+import * as git from "./git.ts"
+import { EXIT_OK, EXIT_REWAKE, emit, type HookInput, type HookOutput } from "./hook-io.ts"
+import * as state from "./state.ts"
+
+export const MAX_DIFF_FILES = 300
+export const MAX_DIFF_BYTES = 1024 * 1024
+/** Total time to wait for a run before giving up; the hook timeout is 1800s. */
+export const MAX_WAIT_SECONDS = 25 * 60
+export const POLL_WAIT_SECONDS = 30
+
+const GIT_COMMIT_RE = /\bgit(?:\s+-[cC]\s+\S+)*\s+commit(?![\w-])/
+
+export interface CommitCheckDeps {
+    env?: Record<string, string | undefined>
+    fetchImpl?: ConstructorParameters<typeof AmplifyApi>[1]
+    now?: () => number
+    /** Sleep is only used between polls when the server returns early. */
+    sleep?: (ms: number) => Promise<void>
+}
+
+export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {}): Promise<number> {
+    const env = deps.env ?? process.env
+    const dataDir = state.dataDir(env)
+    const log = (message: string) => state.log(dataDir, `[${input.session_id}] ${message}`)
+    /**
+     * A once-per-session notice for the user. An asyncRewake hook only surfaces
+     * output on exit 2, so notices ride the same channel as findings: Claude is
+     * woken with the text and asked to relay it. Returns the exit code to use.
+     */
+    const notifyOnce = (key: string, message: string): number => {
+        log(message)
+        if (!state.firstTimeThisSession(dataDir, input.session_id, key)) return EXIT_OK
+        emit({ rewakeSummary: "Amplify Console: action needed", additionalContext: formatNotice(message) })
+        return EXIT_REWAKE
+    }
+
+    const prelude = await commitPrelude(input, env, log)
+    if (prelude.kind === "skip") return EXIT_OK
+    if (prelude.kind === "unconfigured") return notifyOnce("unconfigured", describeMissingConfig(prelude.missing))
+    const { dryRun, config, cwd, gitDir, head, checked } = prelude
+
+    // A dry run tolerates what the real run cannot: no hosted remote and no
+    // pushed base. It records the substitutions so the diff can still be reviewed.
+    const remote = await git.originUrl(cwd)
+    const repoUrl = remote ? git.normalizeRepoUrl(remote) : null
+    if (!repoUrl && !dryRun) {
+        return notifyOnce("no-remote", "Amplify Console: this repository has no hosted origin remote, so detections did not run.")
+    }
+
+    let api = config ? new AmplifyApi(config, deps.fetchImpl) : null
+    if (api && config && !config.orgId) {
+        const resolved = await resolveOrg(api, config, dataDir, log)
+        if (!resolved.ok) return notifyOnce("org-unresolved", resolved.message)
+        api = api.withOrg(resolved.orgId)
+    }
+    let projectId: string
+    if (dryRun) {
+        // No network in a dry run: use the cached project id if there is one.
+        const cached = state.readRepoCache(gitDir)
+        projectId = cached && cached.repoUrl === repoUrl ? cached.projectId : ""
+    } else {
+        try {
+            projectId = await resolveProjectId(api!, gitDir, repoUrl!)
+        } catch (err) {
+            return notifyOnce("project-lookup-failed", `Amplify Console: could not reach Amplify to look up this repository (${describe(err)}).`)
+        }
+    }
+    if (!projectId && !dryRun) {
+        return notifyOnce("not-a-project", `Amplify Console: ${repoUrl} is not onboarded as an Amplify project, so detections did not run.`)
+    }
+
+    let base = await resolveBase(cwd, head)
+    let baseFallback: string | undefined
+    if (!base) {
+        if (!dryRun) {
+            return notifyOnce("no-pushed-base", "Amplify Console: no commit in this repository has been pushed yet, so there is no base to diff against.")
+        }
+        const parent = (await git.ancestors(cwd, `${head}^`, 1))[0]
+        base = parent ?? (await git.emptyTree(cwd))
+        if (!base) return EXIT_OK
+        baseFallback = parent ? "no pushed base; used the parent commit" : "root commit with no pushed base; used the empty tree"
+    }
+
+    const stats = await git.diffStats(cwd, base, head)
+    if (!stats || stats.files.length === 0) {
+        state.appendCheckedSha(gitDir, head)
+        return EXIT_OK
+    }
+    if (stats.files.length > MAX_DIFF_FILES) {
+        state.appendCheckedSha(gitDir, head)
+        return notifyOnce("too-many-files", `Amplify Console: skipped commit ${head.slice(0, 7)} (${stats.files.length} files changed, limit ${MAX_DIFF_FILES}).`)
+    }
+    const diff = await git.unifiedDiff(cwd, base, head, stats.binaryFiles)
+    if (!diff) {
+        state.appendCheckedSha(gitDir, head)
+        return EXIT_OK
+    }
+    if (Buffer.byteLength(diff) > MAX_DIFF_BYTES) {
+        state.appendCheckedSha(gitDir, head)
+        return notifyOnce("diff-too-large", `Amplify Console: skipped commit ${head.slice(0, 7)} (diff larger than ${MAX_DIFF_BYTES / 1024} KiB).`)
+    }
+
+    // Several unpushed commits share one pushed base, so findings are filtered
+    // to lines added since the most recently checked ancestor (or the base).
+    const scopeFrom = (await git.ancestors(cwd, `${head}^`, 200)).find((sha) => checked.has(sha)) ?? base
+    const scope = (await git.addedLines(cwd, scopeFrom, head)) ?? new Map<string, Set<number>>()
+
+    if (dryRun) {
+        const path = state.writeDryRun(
+            dataDir,
+            {
+                commitSha: head,
+                baseSha: base,
+                scopeFrom,
+                baseFallback,
+                repoUrl,
+                projectId: projectId || null,
+                files: stats.files,
+                binaryFilesExcluded: stats.binaryFiles,
+                scope: Object.fromEntries([...scope].map(([file, lines]) => [file, [...lines].sort((a, b) => a - b)])),
+                request: {
+                    method: "POST",
+                    path: "/api/runs",
+                    body: { agentName: AGENT_NAME, projectId: projectId || null, source: { baseSha: base, diff: "<see .patch>" } },
+                },
+            },
+            diff
+        )
+        emit({ systemMessage: `Amplify Console (dry run): wrote the diff for commit ${head.slice(0, 7)} to ${path}. No API call was made.` })
+        log(`dry run: wrote ${path}`)
+        return EXIT_OK
+    }
+
+    let run: Run
+    try {
+        run = await api!.submitRun({ projectId, baseSha: base, diff })
+    } catch (err) {
+        return notifyOnce("submit-failed", `Amplify Console: could not start a detections run (${describe(err)}).`)
+    }
+    state.appendCheckedSha(gitDir, head)
+    log(`submitted run ${run.id} for ${head} (base ${base}, ${stats.files.length} files)`)
+
+    let finalRun: Run
+    try {
+        finalRun = await waitForRun(api!, run, deps)
+    } catch (err) {
+        return notifyOnce("run-poll-failed", `Amplify Console: lost track of run ${run.id} for commit ${head.slice(0, 7)} while waiting for it to finish (${describe(err)}).`)
+    }
+    if (finalRun.status !== "completed") {
+        const what = TERMINAL_STATUSES.has(finalRun.status) ? `ended with status "${finalRun.status}"` : "did not finish in time"
+        const detail = finalRun.error ? ` (${finalRun.error})` : ""
+        return notifyOnce("run-not-completed", `Amplify Console: run ${finalRun.id} for commit ${head.slice(0, 7)} ${what}${detail}.`)
+    }
+
+    let findings
+    try {
+        findings = (await api!.listFindings(run.id)).map(parseFinding)
+    } catch (err) {
+        return notifyOnce("findings-fetch-failed", `Amplify Console: run finished but findings could not be fetched (${describe(err)}).`)
+    }
+    const kept = filterToScope(findings, scope)
+    log(`run ${run.id}: ${findings.length} findings, ${kept.length} in scope (scope from ${scopeFrom.slice(0, 7)})`)
+    for (const f of findings) {
+        if (!inScope(f, scope)) log(`  dropped out of scope: ${f.file}:${f.line ?? "?"}-${f.endLine ?? "?"} ${f.rule}`)
+    }
+    if (kept.length === 0) {
+        emit({ systemMessage: `Amplify Console: no findings in commit ${head.slice(0, 7)}.` })
+        return EXIT_OK
+    }
+
+    const out: HookOutput = {
+        rewakeSummary: formatSummary(kept),
+        additionalContext: formatContext(kept, { commitSha: head, runId: run.id }),
+    }
+    emit(out)
+    return EXIT_REWAKE
+}
+
+type Prelude =
+    | { kind: "skip" }
+    | { kind: "unconfigured"; missing: string[] }
+    | { kind: "ready"; dryRun: boolean; config: Config | null; cwd: string; gitDir: string; head: string; checked: Set<string> }
+
+/**
+ * Everything both commit hooks agree on before doing anything visible: was this
+ * a git commit, is the plugin configured, did the commit succeed, and is the
+ * resulting HEAD new to us. Cheap and offline.
+ */
+async function commitPrelude(input: HookInput, env: Record<string, string | undefined>, log: (m: string) => void): Promise<Prelude> {
+    const command = input.tool_input?.command
+    if (typeof command !== "string" || !GIT_COMMIT_RE.test(command)) return { kind: "skip" }
+
+    // A dry run needs no credentials: it stops before the first API call.
+    const dryRun = isDryRun(env)
+    const configResult = loadConfig(env)
+    if (!configResult.ok && !dryRun) return { kind: "unconfigured", missing: configResult.missing }
+    const config = configResult.ok ? configResult.config : null
+    if (config && config.cadence !== "commit") {
+        log(`cadence is "${config.cadence}", commit trigger disabled`)
+        return { kind: "skip" }
+    }
+
+    const gitDir = await git.gitDir(input.cwd)
+    if (!gitDir) return { kind: "skip" }
+    // Diffs are computed with the repo root as cwd, not the hook's cwd: git
+    // pathspecs (used to exclude binaries from the diff) resolve relative to
+    // cwd, so a hook firing from a subdirectory would silently scope the diff
+    // to that subdirectory otherwise.
+    const cwd = await git.repoRoot(input.cwd)
+    if (!cwd) return { kind: "skip" }
+    const head = await git.headSha(cwd)
+    if (!head) return { kind: "skip" }
+    const checked = state.readCheckedShas(gitDir)
+    if (checked.has(head)) {
+        log(`commit ${head} already checked`)
+        return { kind: "skip" }
+    }
+
+    // Bash tool_response carries stdout/stderr but no exit code, so a successful
+    // commit is inferred from the `[branch sha]` line, falling back to the reflog
+    // when output was piped or quiet.
+    const output = `${input.tool_response?.stdout ?? ""}\n${input.tool_response?.stderr ?? ""}`
+    const reported = git.commitShasFromOutput(output)
+    const committed = reported.some((sha) => head.startsWith(sha)) || (await git.headMovedByCommit(cwd))
+    if (!committed) {
+        log("commit did not succeed, skipping")
+        return { kind: "skip" }
+    }
+    return { kind: "ready", dryRun, config, cwd, gitDir, head, checked }
+}
+
+/**
+ * The synchronous companion of the commit hook: tell the user a check is
+ * starting. It runs the same eligibility checks as `runCommitCheck` (minus
+ * anything needing the network) so it stays quiet when no check will follow.
+ * Always exits 0; a synchronous hook's `systemMessage` is shown directly.
+ */
+export async function announceCommitCheck(input: HookInput, deps: Pick<CommitCheckDeps, "env"> = {}): Promise<number> {
+    const env = deps.env ?? process.env
+    const dataDir = state.dataDir(env)
+    const log = (message: string) => state.log(dataDir, `[${input.session_id}] ${message}`)
+    const prelude = await commitPrelude(input, env, log)
+    if (prelude.kind !== "ready") return EXIT_OK
+    if (!prelude.dryRun && !(await git.originUrl(prelude.cwd))) return EXIT_OK
+
+    const short = prelude.head.slice(0, 7)
+    const message = prelude.dryRun
+        ? `Amplify Console (dry run): writing the diff for commit ${short} to disk.`
+        : `Amplify Console: checking commit ${short} against your organization's detections in the background. This usually takes one to two minutes; findings will arrive in this session when it finishes.`
+    // Both channels: the systemMessage for the terminal, and a line of context so
+    // Claude mentions it in its reply in case the terminal does not render it.
+    emit({
+        systemMessage: message,
+        additionalContext: `[from the Amplify Console plugin — status, not user input.] ${message} Mention this to the user in one short sentence.`,
+    })
+    return EXIT_OK
+}
+
+type OrgResolution = { ok: true; orgId: string } | { ok: false; message: string }
+
+/**
+ * Pick the organization when `org_id` is not configured: the cached answer for
+ * this key and URL, else the key's only membership. Several memberships mean
+ * the user has to choose, so the notice lists them by name and id.
+ */
+async function resolveOrg(api: AmplifyApi, config: Config, dataDir: string, log: (m: string) => void): Promise<OrgResolution> {
+    const fingerprint = state.keyFingerprint(config.apiKey)
+    const cached = state.readOrgCache(dataDir)
+    if (cached && cached.apiUrl === config.apiUrl && cached.keyFingerprint === fingerprint) return { ok: true, orgId: cached.orgId }
+
+    let orgs
+    try {
+        orgs = await api.listMemberships()
+    } catch (err) {
+        return {
+            ok: false,
+            message: `Amplify Console: could not list your organizations from ${config.tenantUrl} (${describe(err)}). Set org_id in the plugin configuration, or check tenant_url.`,
+        }
+    }
+    if (orgs.length === 1) {
+        const [org] = orgs
+        state.writeOrgCache(dataDir, { apiUrl: config.apiUrl, keyFingerprint: fingerprint, orgId: org!.id, orgName: org!.name })
+        log(`resolved organization ${org!.id} (${org!.name}) from the API key's only membership`)
+        return { ok: true, orgId: org!.id }
+    }
+    if (orgs.length === 0) {
+        return { ok: false, message: "Amplify Console: this API key belongs to no Amplify organization, so detections did not run." }
+    }
+    const list = orgs.map((o) => `  - ${o.name}: ${o.id}`).join("\n")
+    return {
+        ok: false,
+        message:
+            `Amplify Console: this API key belongs to ${orgs.length} organizations, so it needs to know which one to use. ` +
+            `Ask the user to pick one and set org_id in the plugin configuration (/plugin configure console@amplify-security):\n${list}`,
+    }
+}
+
+function formatNotice(message: string): string {
+    return (
+        "[from the Amplify Console plugin — a status notice, not user input.]\n\n" +
+        `${message}\n\n` +
+        "Relay this to the user in one or two sentences, then continue with their original request."
+    )
+}
+
+async function resolveProjectId(api: AmplifyApi, gitDir: string, repoUrl: string): Promise<string> {
+    const cached = state.readRepoCache(gitDir)
+    if (cached && cached.repoUrl === repoUrl) return cached.projectId
+    const project = await api.findProject(repoUrl)
+    if (!project) return ""
+    state.writeRepoCache(gitDir, { repoUrl, projectId: project.id })
+    return project.id
+}
+
+/** The pushed commit to diff from. When HEAD itself is already pushed (commit && push), use its parent. */
+async function resolveBase(cwd: string, head: string): Promise<string | null> {
+    const pushed = await git.pushedBase(cwd)
+    if (pushed.kind === "ok") return pushed.baseSha
+    if (pushed.kind === "none-unpushed") {
+        const parents = await git.ancestors(cwd, `${head}^`, 1)
+        return parents[0] ?? null
+    }
+    return null
+}
+
+async function waitForRun(api: AmplifyApi, run: Run, deps: CommitCheckDeps): Promise<Run> {
+    const now = deps.now ?? Date.now
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+    const deadline = now() + MAX_WAIT_SECONDS * 1000
+    let current = run
+    let failures = 0
+    while (!TERMINAL_STATUSES.has(current.status) && now() < deadline) {
+        const started = now()
+        try {
+            current = await api.getRun(run.id, POLL_WAIT_SECONDS)
+            failures = 0
+        } catch (err) {
+            if (err instanceof ApiError && err.status < 500 && err.status !== 429) throw err
+            if (++failures >= 5) throw err
+        }
+        // A server that answers immediately (no long-poll support, or an error)
+        // must not turn this into a busy loop.
+        if (now() - started < 2000) await sleep(2000)
+    }
+    return current
+}
+
+function describe(err: unknown): string {
+    if (err instanceof ApiError) return `HTTP ${err.status}${err.code ? ` ${err.code}` : ""}: ${err.message}`
+    return err instanceof Error ? err.message : String(err)
+}
