@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { appendFileSync, mkdtempSync, readdirSync } from "node:fs"
+import { appendFileSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -41,9 +41,13 @@ describe("state", () => {
     test("repo cache round-trips and tolerates corruption", () => {
         const gitDir = tmp()
         expect(readRepoCache(gitDir)).toBeNull()
-        writeRepoCache(gitDir, { repoUrl: "https://github.com/o/r.git", projectId: "p1" })
-        expect(readRepoCache(gitDir)).toEqual({ repoUrl: "https://github.com/o/r.git", projectId: "p1" })
-        Bun.write(join(gitDir, "amplify-console.json"), "{not json")
+        writeRepoCache(gitDir, { repoUrl: "https://github.com/o/r.git", orgId: "org_1", projectId: "p1" })
+        expect(readRepoCache(gitDir)).toEqual({ repoUrl: "https://github.com/o/r.git", orgId: "org_1", projectId: "p1" })
+        // An entry from before the cache was keyed by organization is treated as absent.
+        writeFileSync(join(gitDir, "amplify-console.json"), JSON.stringify({ repoUrl: "https://github.com/o/r.git", projectId: "p1" }))
+        expect(readRepoCache(gitDir)).toBeNull()
+        writeFileSync(join(gitDir, "amplify-console.json"), "{not json")
+        expect(readRepoCache(gitDir)).toBeNull()
     })
 
     test("appendCheckedSha only appends, so it can't clobber a line written by a concurrent hook invocation", () => {
@@ -62,7 +66,7 @@ describe("state", () => {
 
     test("writeRepoCache and writeOrgCache write via rename, leaving no temp file behind", () => {
         const gitDir = tmp()
-        writeRepoCache(gitDir, { repoUrl: "https://github.com/o/r.git", projectId: "p1" })
+        writeRepoCache(gitDir, { repoUrl: "https://github.com/o/r.git", orgId: "org_1", projectId: "p1" })
         writeOrgCache(gitDir, { apiUrl: "https://api.test", keyFingerprint: "abc", orgId: "org_1", orgName: "Org" })
         expect(readdirSync(gitDir).sort()).toEqual(["amplify-console.json", "org.json"])
     })

@@ -93,8 +93,9 @@ export function inScope(f: ParsedFinding, scope: Map<string, Set<number>>): bool
     return false
 }
 
-export function filterToScope(findings: ParsedFinding[], scope: Map<string, Set<number>>): ParsedFinding[] {
-    if (scope.size === 0) return findings
+/** A null scope means the added lines could not be computed; nothing is filtered out then. An empty one keeps nothing. */
+export function filterToScope(findings: ParsedFinding[], scope: Map<string, Set<number>> | null): ParsedFinding[] {
+    if (scope === null) return findings
     return findings.filter((f) => inScope(f, scope))
 }
 

@@ -51,10 +51,11 @@ describe("filterToScope", () => {
         expect(filterToScope([span], new Map([["src/db.ts", new Set([44])]]))).toHaveLength(1)
         expect(filterToScope([span], new Map([["src/db.ts", new Set([46])]]))).toHaveLength(0)
     })
-    test("keeps line-less findings when the file changed, and everything when scope is unknown", () => {
+    test("keeps line-less findings when the file changed, everything when scope is unknown, and nothing when no lines were added", () => {
         const noLine = { ...f, line: null }
         expect(filterToScope([noLine], new Map([["src/db.ts", new Set([1])]]))).toHaveLength(1)
-        expect(filterToScope([f], new Map())).toHaveLength(1)
+        expect(filterToScope([f], null)).toHaveLength(1)
+        expect(filterToScope([f], new Map())).toHaveLength(0)
     })
 })
 

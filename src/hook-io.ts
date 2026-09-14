@@ -5,7 +5,9 @@
  * For an asyncRewake PostToolUse hook, model-visible text travels in
  * `hookSpecificOutput.additionalContext`, the user-visible one-liner in
  * `rewakeSummary`, and exiting with code 2 after emitting is what wakes the
- * model. Exiting 0 means "nothing to report".
+ * model. Exiting 0 means "nothing to report". A synchronous PostToolUse hook
+ * is read on exit 0 instead: its `additionalContext` is appended to the tool
+ * result and its `systemMessage` shown to the user.
  */
 
 export interface HookInput {

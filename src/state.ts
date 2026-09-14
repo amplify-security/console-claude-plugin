@@ -101,6 +101,8 @@ export function writeOrgCache(dir: string, cache: OrgCache): void {
 
 export interface RepoCache {
     repoUrl: string
+    /** Project ids are per organization, so a cache entry is only valid for the org it was looked up in. */
+    orgId: string
     projectId: string
 }
 
@@ -115,6 +117,7 @@ export function readRepoCache(gitDir: string): RepoCache | null {
             typeof parsed === "object" &&
             parsed !== null &&
             typeof (parsed as RepoCache).repoUrl === "string" &&
+            typeof (parsed as RepoCache).orgId === "string" &&
             typeof (parsed as RepoCache).projectId === "string"
         ) {
             return parsed as RepoCache
@@ -139,7 +142,8 @@ export interface DryRunRecord {
     projectId: string | null
     files: string[]
     binaryFilesExcluded: string[]
-    scope: Record<string, number[]>
+    /** Null when the added lines could not be computed. */
+    scope: Record<string, number[]> | null
     request: unknown
 }
 

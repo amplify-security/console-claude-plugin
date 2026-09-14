@@ -77,8 +77,8 @@ project's baseline findings in the Amplify Console.
 
 ## Troubleshooting
 
-Messages from the plugin start with "Amplify Console:" and are relayed by Claude. Each appears at most
-once per session.
+Messages from the plugin start with "Amplify Console:" and are relayed by Claude. A configuration
+problem is reported once per session; a check that was skipped or failed is reported once per commit.
 
 | Message                                    | Meaning                                                                                  |
 |--------------------------------------------|------------------------------------------------------------------------------------------|

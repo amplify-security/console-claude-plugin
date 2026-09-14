@@ -14,6 +14,8 @@ export interface GitResult {
 }
 
 const GIT_CONFIG = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.quotePath=false"]
+/** Force the `a/` `b/` header prefixes the server's `git apply` expects, whatever the user's `diff.noprefix` / `diff.mnemonicPrefix`. */
+const DIFF_PREFIX = ["--src-prefix=a/", "--dst-prefix=b/"]
 
 export async function git(cwd: string, args: string[]): Promise<GitResult> {
     const proc = Bun.spawn(["git", ...GIT_CONFIG, ...args], { cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore" })
@@ -120,13 +122,13 @@ export async function diffStats(cwd: string, from: string, to: string): Promise<
  */
 export async function unifiedDiff(cwd: string, from: string, to: string, exclude: string[]): Promise<string | null> {
     const pathspec = exclude.length > 0 ? ["--", ".", ...exclude.map((p) => `:(exclude,literal)${p}`)] : []
-    const result = await git(cwd, ["diff", "--no-color", "--no-ext-diff", "--no-renames", from, to, ...pathspec])
+    const result = await git(cwd, ["diff", "--no-color", "--no-ext-diff", "--no-renames", ...DIFF_PREFIX, from, to, ...pathspec])
     return result.code === 0 ? result.stdout : null
 }
 
 /** Added-line numbers per file (paths as of `to`) between two commits. */
 export async function addedLines(cwd: string, from: string, to: string): Promise<Map<string, Set<number>> | null> {
-    const out = await gitOut(cwd, ["diff", "--no-color", "--no-ext-diff", "--no-renames", "--unified=0", from, to])
+    const out = await gitOut(cwd, ["diff", "--no-color", "--no-ext-diff", "--no-renames", "--unified=0", ...DIFF_PREFIX, from, to])
     if (out === null) return null
     return parseAddedLines(out)
 }
@@ -134,9 +136,18 @@ export async function addedLines(cwd: string, from: string, to: string): Promise
 export function parseAddedLines(diff: string): Map<string, Set<number>> {
     const result = new Map<string, Set<number>>()
     let current: Set<number> | null = null
+    // New-side lines still to come in the current hunk. While there are any, a
+    // line is content, not a header: added text starting with `++ ` would
+    // otherwise read as a `+++ ` file header.
+    let remaining = 0
     for (const line of diff.split("\n")) {
+        if (remaining > 0) {
+            if (line.startsWith("+") || line.startsWith(" ")) remaining--
+            continue
+        }
         if (line.startsWith("+++ ")) {
-            const target = line.slice(4)
+            // git appends a TAB after a path that contains whitespace.
+            const target = line.slice(4).split("\t")[0]!
             if (target === "/dev/null") {
                 current = null
                 continue
@@ -147,10 +158,11 @@ export function parseAddedLines(diff: string): Map<string, Set<number>> {
             continue
         }
         const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line)
-        if (hunk && current) {
+        if (hunk) {
             const start = Number(hunk[1])
             const count = hunk[2] === undefined ? 1 : Number(hunk[2])
-            for (let i = 0; i < count; i++) current.add(start + i)
+            remaining = count
+            if (current) for (let i = 0; i < count; i++) current.add(start + i)
         }
     }
     return result
@@ -169,10 +181,18 @@ export async function ancestors(cwd: string, ref: string, max: number): Promise<
     return out === null ? [] : out.split("\n").filter(Boolean)
 }
 
-/** Whether HEAD's most recent reflog entry was written by a commit (incl. amend). */
-export async function headMovedByCommit(cwd: string): Promise<boolean> {
-    const subject = await gitOut(cwd, ["reflog", "-1", "--format=%gs"])
-    return subject !== null && /^commit\b/.test(subject)
+/**
+ * Whether HEAD's most recent reflog entry was written by a commit (incl. amend)
+ * within the last `maxAgeSeconds`. A failed `git commit` writes no reflog entry,
+ * so without the age bound the previous, possibly user-made, commit would pass.
+ */
+export async function headMovedByRecentCommit(cwd: string, maxAgeSeconds: number, now: () => number = Date.now): Promise<boolean> {
+    const out = await gitOut(cwd, ["reflog", "-1", "--date=unix", "--format=%gs%x09%gd"])
+    if (out === null) return false
+    const [subject, selector] = out.split("\t")
+    const at = /@\{(\d+)\}$/.exec(selector ?? "")
+    if (!subject || !at || !/^commit\b/.test(subject)) return false
+    return now() / 1000 - Number(at[1]) <= maxAgeSeconds
 }
 
 /** The hash of the empty tree, for diffing a root commit against nothing. */

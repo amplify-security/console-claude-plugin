@@ -28,4 +28,6 @@ BUN="$(find_bun)" || {
     exit 0
 }
 
-exec "$BUN" run "${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}/src/main.ts" "$TRIGGER"
+# --env-file=/dev/null: Bun otherwise loads `.env` from the cwd, which is the
+# user's repository, so a repo-shipped file could point AMPLIFY_* elsewhere.
+exec "$BUN" --env-file=/dev/null run "${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}/src/main.ts" "$TRIGGER"

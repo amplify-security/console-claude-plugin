@@ -240,13 +240,14 @@ describe("runCommitCheck", () => {
         expect(server2.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(true)
     })
 
-    test("dry run writes the diff and request to disk, makes no API calls, and leaves the commit unchecked", async () => {
+    test("dry run writes the diff and request to disk, makes no API calls (not even to resolve the org), and leaves the commit unchecked", async () => {
         const repo = fixtureRepo()
         const head = repo.commit({ "src/a.ts": "line1\n" }, "a")
         const server = fakeServer()
         const dataDir = tmp()
+        // Configured with a key but no org_id: a real run would list memberships first.
         const { result, out } = await capture(() =>
-            runCommitCheck(input(repo.work, head), { env: { CLAUDE_PLUGIN_DATA: dataDir, AMPLIFY_DRY_RUN: "1" }, fetchImpl: server.fetchImpl, ...fast })
+            runCommitCheck(input(repo.work, head), { env: { CLAUDE_PLUGIN_DATA: dataDir, AMPLIFY_DRY_RUN: "1", AMPLIFY_API_KEY: "key" }, fetchImpl: server.fetchImpl, ...fast })
         )
         expect(result).toBe(0)
         expect(server.calls).toHaveLength(0)
@@ -327,6 +328,77 @@ describe("runCommitCheck", () => {
         expect(server.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(false)
     })
 
+    test("a commit that adds no lines re-surfaces nothing from earlier unpushed commits", async () => {
+        const repo = fixtureRepo()
+        const first = repo.commit({ "src/a.ts": "line1\n" }, "add a")
+        const dataDir = tmp()
+        // The server keeps reporting the finding from the first commit for every base..HEAD run.
+        const server = fakeServer({ findings: [finding("src/a.ts", 1)] })
+        const a = await capture(() => runCommitCheck(input(repo.work, first), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
+        expect(a.result).toBe(2)
+
+        run(repo.work, ["git", "rm", "-q", "README.md"])
+        run(repo.work, ["git", "commit", "-q", "-m", "delete only"])
+        const second = run(repo.work, ["git", "rev-parse", "HEAD"])
+        const b = await capture(() => runCommitCheck(input(repo.work, second), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
+        expect(b.result).toBe(0)
+        expect(JSON.parse(b.out.trim()).systemMessage).toContain("no findings")
+    })
+
+    test("a failed submission is reported for every commit it happens to, not once per session", async () => {
+        const repo = fixtureRepo()
+        const dataDir = tmp()
+        const base = fakeServer()
+        const fetchImpl: FakeServer["fetchImpl"] = async (url, init) => {
+            if (new URL(url).pathname === "/api/runs") return new Response(JSON.stringify({ error: "INTERNAL" }), { status: 500 })
+            return base.fetchImpl(url, init)
+        }
+        const first = repo.commit({ "p.ts": "x\n" }, "p")
+        const a = await capture(() => runCommitCheck(input(repo.work, first), { env: env(dataDir), fetchImpl, ...fast }))
+        const second = repo.commit({ "q.ts": "y\n" }, "q")
+        const b = await capture(() => runCommitCheck(input(repo.work, second), { env: env(dataDir), fetchImpl, ...fast }))
+        expect(a.result).toBe(2)
+        expect(noticeOf(a.out)).toContain(`could not start a detections run for commit ${first.slice(0, 7)}`)
+        expect(b.result).toBe(2)
+        expect(noticeOf(b.out)).toContain(`could not start a detections run for commit ${second.slice(0, 7)}`)
+    })
+
+    test("without the `[branch sha]` line, only a commit made moments ago counts; an older one is not Claude's", async () => {
+        const repo = fixtureRepo()
+        const head = repo.commit({ "u.ts": "x\n" }, "user commit")
+        const quiet: HookInput = { ...input(repo.work, head), tool_input: { command: "git commit -q -m x" }, tool_response: { stdout: "" } }
+
+        // The same reflog entry, seen ten minutes later: a failed `git commit` wrote nothing newer.
+        const stale = fakeServer()
+        const later = () => Date.now() + 10 * 60 * 1000
+        const a = await capture(() => runCommitCheck(quiet, { env: env(tmp()), fetchImpl: stale.fetchImpl, ...fast, now: later }))
+        expect(a.result).toBe(0)
+        expect(a.out).toBe("")
+        expect(stale.calls).toHaveLength(0)
+        expect(readCheckedShas(join(repo.work, ".git")).has(head)).toBe(false)
+
+        const fresh = fakeServer()
+        const b = await capture(() => runCommitCheck(quiet, { env: env(tmp()), fetchImpl: fresh.fetchImpl, ...fast }))
+        expect(b.result).toBe(0)
+        expect(fresh.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(true)
+    })
+
+    test("the cached project id is only reused for the organization it was looked up in", async () => {
+        const repo = fixtureRepo()
+        const head = repo.commit({ "k.ts": "x\n" }, "k")
+        const dataDir = tmp()
+        const one = fakeServer()
+        await capture(() => runCommitCheck(input(repo.work, head), { env: env(dataDir), fetchImpl: one.fetchImpl, ...fast }))
+        expect(one.calls.filter((c) => c.url.includes("/api/projects"))).toHaveLength(1)
+        expect(JSON.parse(readFileSync(join(repo.work, ".git", "amplify-console.json"), "utf8"))).toMatchObject({ orgId: "org_1", projectId: "p1" })
+
+        const head2 = repo.commit({ "k2.ts": "y\n" }, "k2")
+        const two = fakeServer({ project: "p2" })
+        await capture(() => runCommitCheck(input(repo.work, head2), { env: env(dataDir, { AMPLIFY_ORG_ID: "org_2" }), fetchImpl: two.fetchImpl, ...fast }))
+        expect(two.calls.filter((c) => c.url.includes("/api/projects"))).toHaveLength(1)
+        expect(two.calls.find((c) => c.url.endsWith("/api/runs"))!.body).toMatchObject({ projectId: "p2" })
+    })
+
     test("the synchronous commit-start hook announces a check only when one will run", async () => {
         const repo = fixtureRepo()
         const head = repo.commit({ "s.ts": "x\n" }, "s")
@@ -353,5 +425,12 @@ describe("runCommitCheck", () => {
         await capture(() => runCommitCheck(input(repo.work, head), { env: env(dataDir), fetchImpl: fakeServer().fetchImpl, ...fast }))
         const checked = await capture(() => announceCommitCheck(input(repo.work, head), { env: env(dataDir) }))
         expect(checked.out).toBe("")
+
+        // A remote the real check rejects (not a hosted URL) is not announced either.
+        const local = fixtureRepo()
+        const localHead = local.commit({ "l.ts": "x\n" }, "l")
+        run(local.work, ["git", "remote", "set-url", "origin", "/srv/git/app.git"])
+        const unsupported = await capture(() => announceCommitCheck(input(local.work, localHead), { env: env(dataDir) }))
+        expect(unsupported.out).toBe("")
     })
 })

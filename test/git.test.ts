@@ -6,6 +6,7 @@ import {
     commitShasFromOutput,
     diffStats,
     gitDir,
+    headMovedByRecentCommit,
     headSha,
     normalizeRepoUrl,
     originUrl,
@@ -62,6 +63,29 @@ describe("parseAddedLines", () => {
         const lines = parseAddedLines(diff)
         expect([...lines.get("src/a.ts")!].sort((a, b) => a - b)).toEqual([4, 5, 12])
         expect(lines.has("gone.ts")).toBe(false)
+    })
+
+    test("an added line starting with `++ ` is content, not a file header", () => {
+        const diff = [
+            "diff --git a/plain.ts b/plain.ts",
+            "--- a/plain.ts",
+            "+++ b/plain.ts",
+            "@@ -0,0 +1,2 @@",
+            "+++ x",
+            "+y",
+            "@@ -5 +7 @@",
+            "-old",
+            "+new",
+            "\\ No newline at end of file",
+        ].join("\n")
+        const lines = parseAddedLines(diff)
+        expect([...lines.keys()]).toEqual(["plain.ts"])
+        expect([...lines.get("plain.ts")!].sort((a, b) => a - b)).toEqual([1, 2, 7])
+    })
+
+    test("strips the TAB git appends after a path containing whitespace", () => {
+        const diff = ["--- a/my file.ts\t", "+++ b/my file.ts\t", "@@ -0,0 +1 @@", "+x"].join("\n")
+        expect([...parseAddedLines(diff).keys()]).toEqual(["my file.ts"])
     })
 })
 
@@ -138,6 +162,36 @@ describe("repository operations", () => {
         run(clone, ["git", "apply", patch])
         expect(require("node:fs").readFileSync(join(clone, "src/x.ts"), "utf8")).toBe("const x = 1")
         expect(require("node:fs").existsSync(join(clone, "logo.png"))).toBe(false)
+    })
+
+    test("diff headers keep the a/ b/ prefixes the server's `git apply` needs, whatever the user's diff config", async () => {
+        const repo = fixtureRepo()
+        run(repo.work, ["git", "config", "diff.noprefix", "true"])
+        run(repo.work, ["git", "config", "diff.mnemonicPrefix", "true"])
+        const head = repo.commit({ "src/y.ts": "line1\n", "my file.ts": "a\nb\n" }, "prefix")
+
+        const diff = (await unifiedDiff(repo.work, repo.first, head, []))!
+        expect(diff).toContain("--- /dev/null\n+++ b/src/y.ts")
+        const clone = tmp()
+        run(clone, ["git", "clone", "-q", repo.remote, "."])
+        run(clone, ["git", "checkout", "-q", repo.first])
+        const patch = join(tmp(), "diff.patch")
+        writeFileSync(patch, diff)
+        run(clone, ["git", "apply", "--whitespace=nowarn", patch])
+
+        const lines = (await addedLines(repo.work, repo.first, head))!
+        expect([...lines.keys()].sort()).toEqual(["my file.ts", "src/y.ts"])
+        expect([...lines.get("my file.ts")!]).toEqual([1, 2])
+    })
+
+    test("headMovedByRecentCommit accepts a fresh commit and rejects a stale or non-commit reflog entry", async () => {
+        const repo = fixtureRepo()
+        repo.commit({ "r.ts": "x\n" }, "r")
+        expect(await headMovedByRecentCommit(repo.work, 120)).toBe(true)
+        // Ten minutes later, the same entry no longer counts as this tool call's commit.
+        expect(await headMovedByRecentCommit(repo.work, 120, () => Date.now() + 10 * 60 * 1000)).toBe(false)
+        run(repo.work, ["git", "reset", "-q", "--soft", "HEAD"])
+        expect(await headMovedByRecentCommit(repo.work, 120)).toBe(false)
     })
 
     test("repoRoot, gitDir and originUrl resolve from a subdirectory", async () => {
