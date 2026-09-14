@@ -31,7 +31,8 @@ describe("normalizeRepoUrl", () => {
 
     test("preserves a non-default port", () => {
         expect(normalizeRepoUrl("https://git.internal.corp:8443/group/repo.git")).toBe("https://git.internal.corp:8443/group/repo.git")
-        expect(normalizeRepoUrl("ssh://git@git.internal.corp:2222/group/repo.git")).toBe("https://git.internal.corp:2222/group/repo.git")
+        // An ssh port is the ssh server's, not part of the https clone URL the project stores.
+        expect(normalizeRepoUrl("ssh://git@git.internal.corp:2222/group/repo.git")).toBe("https://git.internal.corp/group/repo.git")
         expect(normalizeRepoUrl("https://github.com:443/owner/repo.git")).toBe("https://github.com/owner/repo.git")
     })
 
@@ -107,6 +108,9 @@ describe("repository operations", () => {
         expect(await pushedBase(repo.work)).toEqual({ kind: "ok", baseSha: repo.first })
         expect(await headSha(repo.work)).toBe(third)
         expect(second).not.toBe(third)
+        // Pushed to a remote other than origin (a fork, a backup): still not a usable base.
+        run(repo.work, ["git", "push", "-q", "local", "main"])
+        expect(await pushedBase(repo.work)).toEqual({ kind: "ok", baseSha: repo.first })
 
         const lonely = tmp()
         run(lonely, ["git", "init", "-q"])
@@ -203,5 +207,14 @@ describe("repository operations", () => {
         // A global url.<base>.insteadOf rule may rewrite the reported URL; normalization must undo it.
         expect(normalizeRepoUrl((await originUrl(sub))!)).toBe("https://github.com/acme/app.git")
         expect(await repoRoot(tmp())).toBeNull()
+    })
+
+    test("gitDir is the shared .git even from a linked worktree, so checked commits are not tracked per worktree", async () => {
+        const repo = fixtureRepo()
+        const main = run(repo.work, ["git", "rev-parse", "--show-toplevel"])
+        const wt = join(tmp(), "wt")
+        run(repo.work, ["git", "worktree", "add", "-q", wt, "-b", "feature"])
+        expect(await gitDir(wt)).toBe(join(main, ".git"))
+        expect(await gitDir(repo.work)).toBe(join(main, ".git"))
     })
 })

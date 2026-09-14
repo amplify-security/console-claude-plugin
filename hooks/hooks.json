@@ -13,8 +13,38 @@
           },
           {
             "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" commit-start",
+            "if": "Bash(git -C *)",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" commit-start",
+            "if": "Bash(git -c *)",
+            "timeout": 30
+          },
+          {
+            "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" commit",
             "if": "Bash(git commit:*)",
+            "asyncRewake": true,
+            "timeout": 1800,
+            "rewakeMessage": "Message from the Amplify Console plugin about the commit you just made. Follow the instructions in it, then continue with the user's original request or keep waiting for their reply:",
+            "rewakeSummary": "Amplify Console has something for you"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" commit",
+            "if": "Bash(git -C *)",
+            "asyncRewake": true,
+            "timeout": 1800,
+            "rewakeMessage": "Message from the Amplify Console plugin about the commit you just made. Follow the instructions in it, then continue with the user's original request or keep waiting for their reply:",
+            "rewakeSummary": "Amplify Console has something for you"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" commit",
+            "if": "Bash(git -c *)",
             "asyncRewake": true,
             "timeout": 1800,
             "rewakeMessage": "Message from the Amplify Console plugin about the commit you just made. Follow the instructions in it, then continue with the user's original request or keep waiting for their reply:",

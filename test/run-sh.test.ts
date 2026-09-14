@@ -6,11 +6,14 @@ import { fixtureRepo, tmp } from "./helpers.ts"
 const PLUGIN_ROOT = join(import.meta.dir, "..")
 
 describe("hooks/run.sh", () => {
-    test("does not let the repository's own .env configure the plugin", async () => {
+    test("does not let the repository's own .env or bunfig.toml configure the plugin or run code", async () => {
         const repo = fixtureRepo()
         const head = repo.commit({ "a.ts": "x\n" }, "a")
         // If Bun loaded this, the hook would run in dry-run mode and write a patch instead of complaining.
         writeFileSync(join(repo.work, ".env"), "AMPLIFY_DRY_RUN=1\nAMPLIFY_API_KEY=from-repo-env\n")
+        // If Bun read this, the preload would run inside the hook process before main.ts.
+        writeFileSync(join(repo.work, "bunfig.toml"), 'preload = ["./preload.ts"]\n')
+        writeFileSync(join(repo.work, "preload.ts"), 'console.log("PRELOAD RAN")\n')
         const dataDir = tmp()
 
         const env: Record<string, string> = { CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT, CLAUDE_PLUGIN_DATA: dataDir }
@@ -28,6 +31,23 @@ describe("hooks/run.sh", () => {
 
         expect(code).toBe(2)
         expect(stdout).toContain("not configured")
+        expect(stdout).not.toContain("PRELOAD RAN")
         expect(existsSync(join(dataDir, "dry-run"))).toBe(false)
+    })
+
+    test("without Bun, only the synchronous commit-start hook prints the install reminder", async () => {
+        const dataDir = tmp()
+        const env: Record<string, string> = { CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT, CLAUDE_PLUGIN_DATA: dataDir, PATH: "/usr/bin:/bin", HOME: tmp() }
+        const runHook = async (trigger: string) => {
+            const proc = Bun.spawn(["bash", join(PLUGIN_ROOT, "hooks", "run.sh"), trigger], { env, stdin: new Blob(["{}"]), stdout: "pipe", stderr: "pipe" })
+            const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
+            return { stdout, code }
+        }
+        // The async hook runs in parallel with the sync one and must not consume the once-a-day marker.
+        const asyncHook = await runHook("commit")
+        expect(asyncHook).toEqual({ stdout: "", code: 0 })
+        const syncHook = await runHook("commit-start")
+        expect(syncHook.code).toBe(0)
+        expect(syncHook.stdout).toContain("Bun is not installed")
     })
 })

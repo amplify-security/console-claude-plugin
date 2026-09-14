@@ -19,6 +19,9 @@ find_bun() {
 }
 
 BUN="$(find_bun)" || {
+    # Only the synchronous commit-start hook can show this: both hooks run in
+    # parallel for one commit, and an asyncRewake hook's exit-0 output is dropped.
+    [ "$TRIGGER" = "commit-start" ] || exit 0
     mkdir -p "$DATA_DIR" 2>/dev/null
     marker="$DATA_DIR/bun-missing-notified"
     if [ -z "$(find "$marker" -mtime -1 2>/dev/null)" ]; then
@@ -28,6 +31,9 @@ BUN="$(find_bun)" || {
     exit 0
 }
 
-# --env-file=/dev/null: Bun otherwise loads `.env` from the cwd, which is the
-# user's repository, so a repo-shipped file could point AMPLIFY_* elsewhere.
-exec "$BUN" --env-file=/dev/null run "${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}/src/main.ts" "$TRIGGER"
+ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+# Run from the plugin's own directory. Bun reads `.env` and `bunfig.toml` (which
+# can `preload` arbitrary code) from the cwd, and the cwd here is the user's
+# repository. main.ts takes the repository path from the hook payload instead.
+cd "$ROOT" || exit 0
+exec "$BUN" --env-file=/dev/null run "$ROOT/src/main.ts" "$TRIGGER"

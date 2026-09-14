@@ -6,7 +6,7 @@
  * in-scope findings exits 2, after emitting the model-visible context.
  */
 import { AGENT_NAME, AmplifyApi, ApiError, TERMINAL_STATUSES, type Run } from "./amplify-api.ts"
-import { type Config, describeMissingConfig, isDryRun, loadConfig } from "./config.ts"
+import { type Config, isDryRun, loadConfig } from "./config.ts"
 import { filterToScope, formatContext, formatSummary, inScope, parseFinding } from "./findings.ts"
 import * as git from "./git.ts"
 import { EXIT_OK, EXIT_REWAKE, emit, type HookInput, type HookOutput } from "./hook-io.ts"
@@ -23,6 +23,12 @@ export const POLL_WAIT_SECONDS = 30
  */
 export const RECENT_COMMIT_SECONDS = 120
 
+/**
+ * Which commands are commits. hooks.json pre-filters with prefix rules
+ * (`Bash(git commit:*)`, `Bash(git -C *)`, `Bash(git -c *)`), since a rule
+ * cannot express "commit after any options"; this regex does the exact test,
+ * including the `-C <dir>` and `-c key=value` forms those prefixes let through.
+ */
 const GIT_COMMIT_RE = /\bgit(?:\s+-[cC]\s+\S+)*\s+commit(?![\w-])/
 
 export interface CommitCheckDeps {
@@ -52,7 +58,7 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
 
     const prelude = await commitPrelude(input, env, log, deps.now)
     if (prelude.kind === "skip") return EXIT_OK
-    if (prelude.kind === "unconfigured") return notifyOnce("unconfigured", describeMissingConfig(prelude.missing))
+    if (prelude.kind === "unconfigured") return notifyOnce("unconfigured", prelude.problem)
     const { dryRun, config, cwd, gitDir, head, checked } = prelude
     /** Like notifyOnce, but per commit: a check that was skipped or lost is worth hearing about each time. */
     const notifyPerCommit = (key: string, message: string): number => notifyOnce(`${key}-${head.slice(0, 12)}`, message)
@@ -150,8 +156,8 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
             },
             diff
         )
-        emit({ systemMessage: `Amplify Console (dry run): wrote the diff for commit ${head.slice(0, 7)} to ${path}. No API call was made.` })
-        log(`dry run: wrote ${path}`)
+        // Exit-0 output from an asyncRewake hook is discarded, so the log is the record.
+        log(`dry run: wrote ${path}; no API call was made`)
         return EXIT_OK
     }
 
@@ -188,7 +194,10 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
         if (scope && !inScope(f, scope)) log(`  dropped out of scope: ${f.file}:${f.line ?? "?"}-${f.endLine ?? "?"} ${f.rule}`)
     }
     if (kept.length === 0) {
-        emit({ systemMessage: `Amplify Console: no findings in commit ${head.slice(0, 7)}.` })
+        // Silent by design: exit-0 output from an asyncRewake hook is discarded,
+        // and waking Claude for a clean commit would interrupt it for nothing.
+        // The commit-start announcement tells the user a clean result is silent.
+        log(`no findings in commit ${head}`)
         return EXIT_OK
     }
 
@@ -202,7 +211,7 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
 
 type Prelude =
     | { kind: "skip" }
-    | { kind: "unconfigured"; missing: string[] }
+    | { kind: "unconfigured"; problem: string }
     | { kind: "ready"; dryRun: boolean; config: Config | null; cwd: string; gitDir: string; head: string; checked: Set<string> }
 
 /**
@@ -217,12 +226,8 @@ async function commitPrelude(input: HookInput, env: Record<string, string | unde
     // A dry run needs no credentials: it stops before the first API call.
     const dryRun = isDryRun(env)
     const configResult = loadConfig(env)
-    if (!configResult.ok && !dryRun) return { kind: "unconfigured", missing: configResult.missing }
+    if (!configResult.ok && !dryRun) return { kind: "unconfigured", problem: configResult.problem }
     const config = configResult.ok ? configResult.config : null
-    if (config && config.cadence !== "commit") {
-        log(`cadence is "${config.cadence}", commit trigger disabled`)
-        return { kind: "skip" }
-    }
 
     const gitDir = await git.gitDir(input.cwd)
     if (!gitDir) return { kind: "skip" }
@@ -275,7 +280,7 @@ export async function announceCommitCheck(input: HookInput, deps: Pick<CommitChe
     const short = prelude.head.slice(0, 7)
     const message = prelude.dryRun
         ? `Amplify Console (dry run): writing the diff for commit ${short} to disk.`
-        : `Amplify Console: checking commit ${short} against your organization's detections in the background. This usually takes one to two minutes; findings will arrive in this session when it finishes.`
+        : `Amplify Console: checking commit ${short} against your organization's detections in the background. This usually takes one to two minutes; any findings will arrive in this session when it finishes, and a clean result is silent.`
     // Both channels: the systemMessage for the terminal, and a line of context so
     // Claude mentions it in its reply in case the terminal does not render it.
     emit({

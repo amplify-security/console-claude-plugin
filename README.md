@@ -83,6 +83,7 @@ problem is reported once per session; a check that was skipped or failed is repo
 | Message                                    | Meaning                                                                                  |
 |--------------------------------------------|------------------------------------------------------------------------------------------|
 | "is not configured"                        | No API key. Run `/plugin configure console@amplify-security`.                           |
+| "cadence is set to"                        | Only `commit` is supported. Set `cadence` back to `commit` or clear it.                  |
 | "belongs to N organizations"               | Pick one from the list and set `org_id`.                                                 |
 | "is not onboarded as an Amplify project"   | The repository's `origin` URL does not match a project in your organization.              |
 | "no commit in this repository has been pushed yet" | Push at least once so Amplify has a base commit to check out.                    |

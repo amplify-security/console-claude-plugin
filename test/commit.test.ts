@@ -110,7 +110,7 @@ describe("runCommitCheck", () => {
         expect(readCheckedShas(join(repo.work, ".git")).has(head)).toBe(true)
     })
 
-    test("uses the parent as base after `git commit && git push`, and reports a clean commit", async () => {
+    test("uses the parent as base after `git commit && git push`, and a clean commit is silent", async () => {
         const repo = fixtureRepo()
         const head = repo.commit({ "b.ts": "x\n" }, "b")
         repo.push()
@@ -120,7 +120,8 @@ describe("runCommitCheck", () => {
         )
         expect(result).toBe(0)
         expect(server.calls.find((c) => c.url.endsWith("/api/runs"))!.body).toMatchObject({ source: { baseSha: repo.first } })
-        expect(JSON.parse(out.trim()).systemMessage).toContain("no findings")
+        // Exit-0 output from the asyncRewake hook is never shown, so nothing is emitted.
+        expect(out).toBe("")
     })
 
     test("resolves the repo root when the hook fires from a subdirectory, so the diff isn't scoped to it", async () => {
@@ -250,9 +251,10 @@ describe("runCommitCheck", () => {
             runCommitCheck(input(repo.work, head), { env: { CLAUDE_PLUGIN_DATA: dataDir, AMPLIFY_DRY_RUN: "1", AMPLIFY_API_KEY: "key" }, fetchImpl: server.fetchImpl, ...fast })
         )
         expect(result).toBe(0)
+        expect(out).toBe("")
         expect(server.calls).toHaveLength(0)
         const patch = join(dataDir, "dry-run", `${head.slice(0, 12)}.patch`)
-        expect(JSON.parse(out.trim()).systemMessage).toContain(patch)
+        expect(readFileSync(join(dataDir, "log.txt"), "utf8")).toContain(`dry run: wrote ${patch}`)
         expect(readFileSync(patch, "utf8")).toContain("+++ b/src/a.ts")
         const record = JSON.parse(readFileSync(join(dataDir, "dry-run", `${head.slice(0, 12)}.json`), "utf8"))
         expect(record).toMatchObject({
@@ -342,7 +344,19 @@ describe("runCommitCheck", () => {
         const second = run(repo.work, ["git", "rev-parse", "HEAD"])
         const b = await capture(() => runCommitCheck(input(repo.work, second), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
         expect(b.result).toBe(0)
-        expect(JSON.parse(b.out.trim()).systemMessage).toContain("no findings")
+        expect(b.out).toBe("")
+    })
+
+    test("an unknown cadence is reported like any other misconfiguration", async () => {
+        const repo = fixtureRepo()
+        const head = repo.commit({ "cad.ts": "x\n" }, "cad")
+        const server = fakeServer()
+        const { result, out } = await capture(() =>
+            runCommitCheck(input(repo.work, head), { env: env(tmp(), { AMPLIFY_CADENCE: "push" }), fetchImpl: server.fetchImpl, ...fast })
+        )
+        expect(result).toBe(2)
+        expect(noticeOf(out)).toContain('cadence is set to "push"')
+        expect(server.calls).toHaveLength(0)
     })
 
     test("a failed submission is reported for every commit it happens to, not once per session", async () => {
@@ -408,6 +422,7 @@ describe("runCommitCheck", () => {
         expect(eligible.result).toBe(0)
         const announced = JSON.parse(eligible.out.trim())
         expect(announced.systemMessage).toContain(`checking commit ${head.slice(0, 7)}`)
+        expect(announced.systemMessage).toContain("a clean result is silent")
         expect(announced.hookSpecificOutput.additionalContext).toContain("Mention this to the user")
 
         const dry = await capture(() => announceCommitCheck(input(repo.work, head), { env: { CLAUDE_PLUGIN_DATA: dataDir, AMPLIFY_DRY_RUN: "1" } }))

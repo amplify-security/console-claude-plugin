@@ -18,7 +18,10 @@ export interface Config {
     cadence: string
 }
 
-export type ConfigResult = { ok: true; config: Config } | { ok: false; missing: string[] }
+/** `problem` is the full user-facing notice explaining what is wrong. */
+export type ConfigResult = { ok: true; config: Config } | { ok: false; problem: string }
+
+const CADENCES = ["commit"]
 
 type Env = Record<string, string | undefined>
 
@@ -50,7 +53,15 @@ export function loadConfig(env: Env = process.env): ConfigResult {
 
     const missing: string[] = []
     if (!apiKey) missing.push(SOURCES.apiKey.setting)
-    if (missing.length > 0) return { ok: false, missing }
+    if (missing.length > 0) return { ok: false, problem: describeMissingConfig(missing) }
+    if (!CADENCES.includes(cadence)) {
+        return {
+            ok: false,
+            problem:
+                `Amplify Console: cadence is set to "${cadence}", but only ${CADENCES.map((c) => `"${c}"`).join(", ")} is supported, so detections did not run. ` +
+                `Fix it in /plugin configure console@amplify-security, or unset AMPLIFY_CADENCE.`,
+        }
+    }
 
     return {
         ok: true,

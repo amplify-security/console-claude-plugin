@@ -34,7 +34,12 @@ export function fixtureRepo() {
         run(work, ["git", "commit", "-q", "-m", message])
         return run(work, ["git", "rev-parse", "HEAD"])
     }
-    const push = () => run(work, ["git", "push", "-q", "-u", "local", "main"])
+    // Pushes go to the local bare remote; origin's tracking ref is moved too, since
+    // pushedBase only counts commits that origin has.
+    const push = () => {
+        run(work, ["git", "push", "-q", "-u", "local", "main"])
+        run(work, ["git", "update-ref", "refs/remotes/origin/main", "refs/remotes/local/main"])
+    }
 
     const first = commit({ "README.md": "hello\n" }, "init")
     push()

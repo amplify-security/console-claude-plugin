@@ -5,6 +5,7 @@
  * so the base must already exist on a remote. "Pushed base" here means the
  * first parent of the oldest commit reachable from HEAD but from no remote ref.
  */
+import { realpathSync } from "node:fs"
 import { isAbsolute, join } from "node:path"
 
 export interface GitResult {
@@ -36,10 +37,12 @@ export async function repoRoot(cwd: string): Promise<string | null> {
     return gitOut(cwd, ["rev-parse", "--show-toplevel"])
 }
 
+/** The repository's shared git directory: the main `.git` even from a linked worktree, so repo-wide state is not split per worktree. */
 export async function gitDir(cwd: string): Promise<string | null> {
-    const dir = await gitOut(cwd, ["rev-parse", "--git-dir"])
+    const dir = await gitOut(cwd, ["rev-parse", "--git-common-dir"])
     if (dir === null) return null
-    return isAbsolute(dir) ? dir : join(cwd, dir)
+    // Canonical, so state lands in one place however the hook's cwd was spelled (symlinks, `..`).
+    return realpathSync(isAbsolute(dir) ? dir : join(cwd, dir))
 }
 
 export async function headSha(cwd: string): Promise<string | null> {
@@ -72,9 +75,10 @@ export function normalizeRepoUrl(raw: string): string | null {
             return null
         }
         if (!["https:", "http:", "ssh:", "git:"].includes(parsed.protocol)) return null
-        // `host` (not `hostname`) keeps a non-default port; WHATWG URL already
-        // omits it when it matches the scheme's default (e.g. :443 for https).
-        host = parsed.host
+        // For http(s), `host` keeps a non-default port, which the stored clone
+        // URL carries too (WHATWG URL already drops the scheme default). An
+        // ssh:// or git:// port belongs to that protocol, not to the https URL.
+        host = parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.host : parsed.hostname
         path = parsed.pathname
     }
 
@@ -85,9 +89,13 @@ export function normalizeRepoUrl(raw: string): string | null {
 
 export type PushedBase = { kind: "none-unpushed" } | { kind: "no-pushed-base" } | { kind: "ok"; baseSha: string }
 
-/** Find the nearest ancestor of HEAD that exists on some remote. */
+/**
+ * Find the nearest ancestor of HEAD that exists on `origin`. Only origin counts:
+ * the project is resolved from origin's URL and the server verifies the base
+ * against that repository, so a commit pushed only to a fork is not a base.
+ */
 export async function pushedBase(cwd: string): Promise<PushedBase> {
-    const unpushed = await gitOut(cwd, ["rev-list", "HEAD", "--not", "--remotes"])
+    const unpushed = await gitOut(cwd, ["rev-list", "HEAD", "--not", "--remotes=origin"])
     if (unpushed === null) return { kind: "no-pushed-base" }
     const commits = unpushed.split("\n").filter(Boolean)
     if (commits.length === 0) return { kind: "none-unpushed" }

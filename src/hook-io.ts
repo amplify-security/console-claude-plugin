@@ -65,6 +65,25 @@ export function formatHookOutput(out: HookOutput): string {
     return JSON.stringify(json)
 }
 
+let flushed: Promise<void> = Promise.resolve()
+
 export function emit(out: HookOutput): void {
-    process.stdout.write(formatHookOutput(out) + "\n")
+    const data = formatHookOutput(out) + "\n"
+    flushed = new Promise((resolve) => {
+        process.stdout.write(data, () => resolve())
+    })
+}
+
+/**
+ * Resolves once emitted output has reached the pipe. `process.exit` straight
+ * after `write` truncates anything past the 64 KiB pipe buffer, which a long
+ * findings list can exceed. Bounded so a closed pipe cannot hang the hook.
+ */
+export function outputFlushed(): Promise<void> {
+    return Promise.race([
+        flushed,
+        new Promise<void>((resolve) => {
+            setTimeout(resolve, 5000).unref?.()
+        }),
+    ])
 }

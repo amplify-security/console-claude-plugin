@@ -6,7 +6,7 @@
  * user's commit look broken.
  */
 import { announceCommitCheck, runCommitCheck } from "./commit.ts"
-import { EXIT_OK, readHookInput } from "./hook-io.ts"
+import { EXIT_OK, outputFlushed, readHookInput } from "./hook-io.ts"
 import { dataDir, log } from "./state.ts"
 
 const trigger = process.argv[2] ?? ""
@@ -25,4 +25,5 @@ try {
     log(dataDir(), `unhandled error in trigger "${trigger}": ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`)
     exitCode = EXIT_OK
 }
+await outputFlushed()
 process.exit(exitCode)

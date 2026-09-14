@@ -22,8 +22,8 @@ describe("loadConfig", () => {
 
     test("only the API key is required; org_id is optional and api_url defaults to production", () => {
         const result = loadConfig({ AMPLIFY_API_KEY: "  " })
-        expect(result).toEqual({ ok: false, missing: ["api_key"] })
-        if (!result.ok) expect(describeMissingConfig(result.missing)).toContain("AMPLIFY_API_KEY")
+        expect(result).toEqual({ ok: false, problem: describeMissingConfig(["api_key"]) })
+        if (!result.ok) expect(result.problem).toContain("AMPLIFY_API_KEY")
         const keyOnly = loadConfig({ AMPLIFY_API_KEY: "k" })
         expect(keyOnly).toEqual({
             ok: true,
@@ -32,5 +32,12 @@ describe("loadConfig", () => {
         expect(DEFAULT_API_URL).toBe("https://agent.console.prod.amplify.security")
         expect(DEFAULT_TENANT_URL).toBe("https://tenant.console.prod.amplify.security")
         expect(loadConfig({ AMPLIFY_API_KEY: "k", AMPLIFY_TENANT_PROVISIONER_URL: "https://t/" })).toMatchObject({ config: { tenantUrl: "https://t" } })
+    })
+
+    test("rejects an unknown cadence instead of silently disabling the plugin", () => {
+        const result = loadConfig({ AMPLIFY_API_KEY: "k", AMPLIFY_CADENCE: "push" })
+        expect(result.ok).toBe(false)
+        if (!result.ok) expect(result.problem).toContain('cadence is set to "push"')
+        expect(loadConfig({ AMPLIFY_API_KEY: "k", AMPLIFY_CADENCE: "commit" }).ok).toBe(true)
     })
 })
