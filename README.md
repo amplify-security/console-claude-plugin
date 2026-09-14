@@ -69,7 +69,7 @@ Each setting can also be supplied as an environment variable in the shell that l
 
 Only the diff of the commit Claude just made, computed against the most recent commit that already
 exists on your remote, together with the base commit's SHA. Uncommitted work, untracked files, and
-binary files are never sent. Diffs over 1 MiB or 300 files are skipped. Amplify applies the diff to a
+binary files are never sent. If all unpushed changes together exceed 1 MiB or 300 files, commits are skipped until the next push. Amplify applies the diff to a
 fresh checkout of the base commit for the duration of the check and does not store it.
 
 Findings from these checks are reported into the Claude Code session and are kept separate from your

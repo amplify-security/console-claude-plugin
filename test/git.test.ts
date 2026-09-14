@@ -118,6 +118,23 @@ describe("repository operations", () => {
         expect(await pushedBase(lonely)).toEqual({ kind: "no-pushed-base" })
     })
 
+    test("pushedBase returns a commit origin has even when the unpushed range holds a merge with older dates", async () => {
+        const repo = fixtureRepo()
+        repo.commit({ "k1.ts": "x\n" }, "k1")
+        run(repo.work, ["git", "branch", "side"])
+        repo.commit({ "k2.ts": "x\n" }, "k2")
+        run(repo.work, ["git", "checkout", "-q", "side"])
+        // Dated before everything else: last in commit-date order, yet its parent k1 is unpushed.
+        const old = Bun.spawnSync(["git", "commit", "-q", "--allow-empty", "-m", "old"], {
+            cwd: repo.work,
+            env: { ...process.env, GIT_COMMITTER_DATE: "2020-01-01T00:00:00Z", GIT_AUTHOR_DATE: "2020-01-01T00:00:00Z" },
+        })
+        expect(old.exitCode).toBe(0)
+        run(repo.work, ["git", "checkout", "-q", "main"])
+        run(repo.work, ["git", "merge", "-q", "--no-edit", "side"])
+        expect(await pushedBase(repo.work)).toEqual({ kind: "ok", baseSha: repo.first })
+    })
+
     test("diff helpers exclude binaries and report added lines", async () => {
         const repo = fixtureRepo()
         writeFileSync(join(repo.work, "img.bin"), Buffer.from([0, 1, 2, 3, 0, 255]))

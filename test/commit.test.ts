@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { join } from "node:path"
-import { announceCommitCheck, runCommitCheck } from "../src/commit.ts"
+import { announceCommitCheck, commitDirs, MAX_DIFF_FILES, runCommitCheck } from "../src/commit.ts"
 import type { HookInput } from "../src/hook-io.ts"
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { readCheckedShas } from "../src/state.ts"
@@ -85,6 +85,18 @@ async function capture<T>(fn: () => Promise<T>): Promise<{ result: T; out: strin
 
 const fast = { now: Date.now, sleep: async () => {} }
 
+describe("commitDirs", () => {
+    test("recognizes a commit after -C/-c options, quoted or not, and returns the -C directories", () => {
+        expect(commitDirs("git commit -m x")).toEqual([])
+        expect(commitDirs('git -C "/Users/me/My Repo" commit -m x')).toEqual(["/Users/me/My Repo"])
+        expect(commitDirs("git -c user.name='Foo Bar' -C sub commit")).toEqual(["sub"])
+        expect(commitDirs('git -c user.name="Foo Bar" commit -m x')).toEqual([])
+        expect(commitDirs("git -C a -C b commit")).toEqual(["a", "b"])
+        expect(commitDirs("git status")).toBeNull()
+        expect(commitDirs("git commit-tree HEAD^{tree} -m x")).toBeNull()
+    })
+})
+
 describe("runCommitCheck", () => {
     test("submits the unpushed diff, waits, and wakes Claude with in-scope findings", async () => {
         const repo = fixtureRepo()
@@ -107,7 +119,7 @@ describe("runCommitCheck", () => {
         expect(output.rewakeSummary).toBe("Amplify Console: 1 high in 1 file")
         expect(output.hookSpecificOutput.additionalContext).toContain("src/a.ts:2")
         expect(output.hookSpecificOutput.additionalContext).not.toContain("README.md")
-        expect(readCheckedShas(join(repo.work, ".git")).has(head)).toBe(true)
+        expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(true)
     })
 
     test("uses the parent as base after `git commit && git push`, and a clean commit is silent", async () => {
@@ -265,7 +277,7 @@ describe("runCommitCheck", () => {
             scope: { "src/a.ts": [1] },
             request: { path: "/api/runs", body: { agentName: "detections-runner" } },
         })
-        expect(readCheckedShas(join(repo.work, ".git")).has(head)).toBe(false)
+        expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(false)
         expect(existsSync(patch)).toBe(true)
     })
 
@@ -389,7 +401,7 @@ describe("runCommitCheck", () => {
         expect(a.result).toBe(0)
         expect(a.out).toBe("")
         expect(stale.calls).toHaveLength(0)
-        expect(readCheckedShas(join(repo.work, ".git")).has(head)).toBe(false)
+        expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(false)
 
         const fresh = fakeServer()
         const b = await capture(() => runCommitCheck(quiet, { env: env(tmp()), fetchImpl: fresh.fetchImpl, ...fast }))
@@ -411,6 +423,90 @@ describe("runCommitCheck", () => {
         await capture(() => runCommitCheck(input(repo.work, head2), { env: env(dataDir, { AMPLIFY_ORG_ID: "org_2" }), fetchImpl: two.fetchImpl, ...fast }))
         expect(two.calls.filter((c) => c.url.includes("/api/projects"))).toHaveLength(1)
         expect(two.calls.find((c) => c.url.endsWith("/api/runs"))!.body).toMatchObject({ projectId: "p2" })
+    })
+
+    test("a commit whose run failed stays in scope for the next commit", async () => {
+        const repo = fixtureRepo()
+        const dataDir = tmp()
+        const k1 = repo.commit({ "k1.ts": "bad\n" }, "k1")
+        const failing = fakeServer({ statuses: ["error"] })
+        const a = await capture(() => runCommitCheck(input(repo.work, k1), { env: env(dataDir), fetchImpl: failing.fetchImpl, ...fast }))
+        expect(a.result).toBe(2)
+        expect(noticeOf(a.out)).toContain('status "error"')
+        const afterFailure = readCheckedShas(join(repo.work, ".git"))
+        expect(afterFailure.all.has(k1)).toBe(true) // not resubmitted...
+        expect(afterFailure.completed.has(k1)).toBe(false) // ...but not reviewed either
+
+        // The next commit's run covers base..k2, and k1's finding is still in scope.
+        const k2 = repo.commit({ "k2.ts": "fine\n" }, "k2")
+        const ok = fakeServer({ findings: [finding("k1.ts", 1)] })
+        const b = await capture(() => runCommitCheck(input(repo.work, k2), { env: env(dataDir), fetchImpl: ok.fetchImpl, ...fast }))
+        expect(b.result).toBe(2)
+        expect(JSON.parse(b.out.trim()).hookSpecificOutput.additionalContext).toContain("k1.ts:1")
+        expect(readCheckedShas(join(repo.work, ".git")).completed.has(k2)).toBe(true)
+    })
+
+    test("scope never reaches past the pushed base, so the user's own pushed lines are not attributed to Claude", async () => {
+        const repo = fixtureRepo()
+        const dataDir = tmp()
+        const c1 = repo.commit({ "c1.ts": "x\n" }, "c1")
+        await capture(() => runCommitCheck(input(repo.work, c1), { env: env(dataDir), fetchImpl: fakeServer().fetchImpl, ...fast }))
+        // The user commits by hand and pushes both; c1 is now a completed check older than the base.
+        repo.commit({ "user.ts": "y\n" }, "user")
+        repo.push()
+        const c3 = repo.commit({ "c3.ts": "z\n" }, "c3")
+        const server = fakeServer({ findings: [finding("user.ts", 1), finding("c3.ts", 1)] })
+        const { result, out } = await capture(() => runCommitCheck(input(repo.work, c3), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
+        expect(result).toBe(2)
+        const context = JSON.parse(out.trim()).hookSpecificOutput.additionalContext
+        expect(context).toContain("c3.ts:1")
+        expect(context).not.toContain("user.ts")
+    })
+
+    test("`git -C <dir> commit` is checked against <dir>, even when the hook's cwd is another repository", async () => {
+        const repo = fixtureRepo()
+        const head = repo.commit({ "c.ts": "x\n" }, "c")
+        const workspace = tmp()
+        run(workspace, ["git", "init", "-q"])
+        const server = fakeServer()
+        const hook: HookInput = { ...input(workspace, head), tool_input: { command: `git -C "${repo.work}" commit -m c` } }
+        const { result } = await capture(() => runCommitCheck(hook, { env: env(tmp()), fetchImpl: server.fetchImpl, ...fast }))
+        expect(result).toBe(0)
+        expect(server.calls.find((c) => c.url.endsWith("/api/runs"))!.body).toMatchObject({ source: { baseSha: repo.first } })
+        expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(true)
+        expect(existsSync(join(workspace, ".git", "amplify-checked-shas"))).toBe(false)
+    })
+
+    test("the size limits cover the whole unpushed range and are reported once per base", async () => {
+        const repo = fixtureRepo()
+        const dataDir = tmp()
+        const many = Object.fromEntries(Array.from({ length: MAX_DIFF_FILES + 1 }, (_, i) => [`gen/f${i}.ts`, `${i}\n`]))
+        const huge = repo.commit(many, "huge")
+        const server = fakeServer()
+        const a = await capture(() => runCommitCheck(input(repo.work, huge), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
+        expect(a.result).toBe(2)
+        expect(noticeOf(a.out)).toContain(`skipped commit ${huge.slice(0, 7)}: the unpushed changes since ${repo.first.slice(0, 7)} touch ${MAX_DIFF_FILES + 1} files`)
+        expect(readCheckedShas(join(repo.work, ".git")).completed.has(huge)).toBe(false)
+
+        // A small follow-up commit is still over the limit (same range) and is not reported again.
+        const small = repo.commit({ "small.ts": "x\n" }, "small")
+        const b = await capture(() => runCommitCheck(input(repo.work, small), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
+        expect(b.result).toBe(0)
+        expect(b.out).toBe("")
+        expect(server.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(false)
+    })
+
+    test("a repository-specific notice is given for each repository a session commits in", async () => {
+        const dataDir = tmp()
+        const a = fixtureRepo()
+        const headA = a.commit({ "a.ts": "x\n" }, "a")
+        const b = fixtureRepo()
+        const headB = b.commit({ "b.ts": "x\n" }, "b")
+        const server = fakeServer({ project: null })
+        const first = await capture(() => runCommitCheck(input(a.work, headA), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
+        const second = await capture(() => runCommitCheck(input(b.work, headB), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
+        expect(noticeOf(first.out)).toContain("not onboarded")
+        expect(noticeOf(second.out)).toContain("not onboarded")
     })
 
     test("the synchronous commit-start hook announces a check only when one will run", async () => {

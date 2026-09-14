@@ -25,8 +25,9 @@ export interface Organization {
     name: string
 }
 
-export type RunStatus = "pending" | "running" | "completed" | "error" | "cancelled"
-export const TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "error", "cancelled"])
+export type RunStatus = "pending" | "running" | "completed" | "error" | "cancelled" | "skipped"
+/** Mirrors the server's terminal set; a status missing here would be polled until the deadline. */
+export const TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "error", "cancelled", "skipped"])
 
 export interface Run {
     id: string

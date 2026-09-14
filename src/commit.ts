@@ -2,14 +2,16 @@
  * The commit trigger: build the diff for the commit Claude just made, run the
  * org's detections against it in Amplify, and wake Claude with the findings.
  *
- * Every early exit is code 0 ("nothing to report"). Only a completed run with
- * in-scope findings exits 2, after emitting the model-visible context.
+ * Every early exit is code 0 ("nothing to report"). Exit 2 wakes Claude, either
+ * with in-scope findings or with a notice the user has to act on, after
+ * emitting the model-visible context.
  */
 import { AGENT_NAME, AmplifyApi, ApiError, TERMINAL_STATUSES, type Run } from "./amplify-api.ts"
 import { type Config, isDryRun, loadConfig } from "./config.ts"
 import { filterToScope, formatContext, formatSummary, inScope, parseFinding } from "./findings.ts"
 import * as git from "./git.ts"
 import { EXIT_OK, EXIT_REWAKE, emit, type HookInput, type HookOutput } from "./hook-io.ts"
+import { resolve } from "node:path"
 import * as state from "./state.ts"
 
 export const MAX_DIFF_FILES = 300
@@ -28,8 +30,26 @@ export const RECENT_COMMIT_SECONDS = 120
  * (`Bash(git commit:*)`, `Bash(git -C *)`, `Bash(git -c *)`), since a rule
  * cannot express "commit after any options"; this regex does the exact test,
  * including the `-C <dir>` and `-c key=value` forms those prefixes let through.
+ * An option value is a run of quoted strings and bare characters, so
+ * `-C "My Repo"` and `-c user.name="Foo Bar"` are single values.
  */
-const GIT_COMMIT_RE = /\bgit(?:\s+-[cC]\s+\S+)*\s+commit(?![\w-])/
+const OPTION_VALUE = /(?:"[^"]*"|'[^']*'|[^\s"'])+/
+const GIT_COMMIT_RE = new RegExp(`\\bgit((?:\\s+-[cC]\\s+${OPTION_VALUE.source})*)\\s+commit(?![\\w-])`)
+
+/**
+ * The `-C <dir>` values of a git commit command, in order (git applies them
+ * cumulatively, each relative to the previous), with shell quotes removed.
+ * Null when the command is not a git commit.
+ */
+export function commitDirs(command: string): string[] | null {
+    const match = GIT_COMMIT_RE.exec(command)
+    if (!match) return null
+    const dirs: string[] = []
+    for (const option of match[1]!.matchAll(new RegExp(`-([cC])\\s+(${OPTION_VALUE.source})`, "g"))) {
+        if (option[1] === "C") dirs.push(option[2]!.replace(/"([^"]*)"|'([^']*)'/g, (_, d: string | undefined, s: string | undefined) => d ?? s ?? ""))
+    }
+    return dirs
+}
 
 export interface CommitCheckDeps {
     env?: Record<string, string | undefined>
@@ -60,15 +80,17 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
     if (prelude.kind === "skip") return EXIT_OK
     if (prelude.kind === "unconfigured") return notifyOnce("unconfigured", prelude.problem)
     const { dryRun, config, cwd, gitDir, head, checked } = prelude
-    /** Like notifyOnce, but per commit: a check that was skipped or lost is worth hearing about each time. */
+    /** Like notifyOnce, but per commit: a check that was lost is worth hearing about each time. */
     const notifyPerCommit = (key: string, message: string): number => notifyOnce(`${key}-${head.slice(0, 12)}`, message)
+    /** Like notifyOnce, but per repository: a session can commit in several, each with its own problem. */
+    const notifyPerRepo = (key: string, message: string): number => notifyOnce(`${key}-${state.keyFingerprint(gitDir)}`, message)
 
     // A dry run tolerates what the real run cannot: no hosted remote and no
     // pushed base. It records the substitutions so the diff can still be reviewed.
     const remote = await git.originUrl(cwd)
     const repoUrl = remote ? git.normalizeRepoUrl(remote) : null
     if (!repoUrl && !dryRun) {
-        return notifyOnce("no-remote", "Amplify Console: this repository has no hosted origin remote, so detections did not run.")
+        return notifyPerRepo("no-remote", "Amplify Console: this repository has no hosted origin remote, so detections did not run.")
     }
 
     // A dry run never touches the network, so it gets no client.
@@ -93,14 +115,14 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
         }
     }
     if (!projectId && !dryRun) {
-        return notifyOnce("not-a-project", `Amplify Console: ${repoUrl} is not onboarded as an Amplify project, so detections did not run.`)
+        return notifyPerRepo("not-a-project", `Amplify Console: ${repoUrl} is not onboarded as an Amplify project, so detections did not run.`)
     }
 
     let base = await resolveBase(cwd, head)
     let baseFallback: string | undefined
     if (!base) {
         if (!dryRun) {
-            return notifyOnce("no-pushed-base", "Amplify Console: no commit in this repository has been pushed yet, so there is no base to diff against.")
+            return notifyPerRepo("no-pushed-base", "Amplify Console: no commit in this repository has been pushed yet, so there is no base to diff against.")
         }
         const parent = (await git.ancestors(cwd, `${head}^`, 1))[0]
         base = parent ?? (await git.emptyTree(cwd))
@@ -108,30 +130,38 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
         baseFallback = parent ? "no pushed base; used the parent commit" : "root commit with no pushed base; used the empty tree"
     }
 
+    // The diff is base..HEAD, i.e. every unpushed commit, so the size limits
+    // apply to that whole range: once exceeded, every commit until the next
+    // push is skipped. Reported once per base, and the skipped commits stay
+    // "attempted" so their lines remain in scope for a later check.
+    const short = head.slice(0, 7)
+    const since = `the unpushed changes since ${base.slice(0, 7)}`
     const stats = await git.diffStats(cwd, base, head)
     if (!stats || stats.files.length === 0) {
-        state.appendCheckedSha(gitDir, head)
+        state.appendCheckedSha(gitDir, head, "completed")
         return EXIT_OK
     }
     if (stats.files.length > MAX_DIFF_FILES) {
-        state.appendCheckedSha(gitDir, head)
-        return notifyPerCommit("too-many-files", `Amplify Console: skipped commit ${head.slice(0, 7)} (${stats.files.length} files changed, limit ${MAX_DIFF_FILES}).`)
+        state.appendCheckedSha(gitDir, head, "attempted")
+        return notifyOnce(`too-many-files-${base.slice(0, 12)}`, `Amplify Console: skipped commit ${short}: ${since} touch ${stats.files.length} files (limit ${MAX_DIFF_FILES}). Push to start a new range.`)
     }
     const diff = await git.unifiedDiff(cwd, base, head, stats.binaryFiles)
     if (!diff) {
-        state.appendCheckedSha(gitDir, head)
+        state.appendCheckedSha(gitDir, head, "completed")
         return EXIT_OK
     }
     if (Buffer.byteLength(diff) > MAX_DIFF_BYTES) {
-        state.appendCheckedSha(gitDir, head)
-        return notifyPerCommit("diff-too-large", `Amplify Console: skipped commit ${head.slice(0, 7)} (diff larger than ${MAX_DIFF_BYTES / 1024} KiB).`)
+        state.appendCheckedSha(gitDir, head, "attempted")
+        return notifyOnce(`diff-too-large-${base.slice(0, 12)}`, `Amplify Console: skipped commit ${short}: ${since} exceed ${MAX_DIFF_BYTES / 1024} KiB as a diff. Push to start a new range.`)
     }
 
     // Several unpushed commits share one pushed base, so findings are filtered
-    // to lines added since the most recently checked ancestor (or the base).
-    // A null scope (git failed) is kept distinct from an empty one (a commit
-    // that added no lines): the former filters nothing, the latter everything.
-    const scopeFrom = (await git.ancestors(cwd, `${head}^`, 200)).find((sha) => checked.has(sha)) ?? base
+    // to lines added since the nearest ancestor whose check completed, looking
+    // no further back than the base: an older completed commit would pull the
+    // user's own pushed lines into scope. A null scope (git failed) is kept
+    // distinct from an empty one (a commit that added no lines): the former
+    // filters nothing, the latter everything.
+    const scopeFrom = (await git.range(cwd, base, `${head}^`)).find((sha) => checked.completed.has(sha)) ?? base
     const scope = await git.addedLines(cwd, scopeFrom, head)
     if (!scope) log(`could not compute the lines added since ${scopeFrom.slice(0, 7)}; findings will not be filtered`)
 
@@ -167,7 +197,9 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
     } catch (err) {
         return notifyPerCommit("submit-failed", `Amplify Console: could not start a detections run for commit ${head.slice(0, 7)} (${describe(err)}).`)
     }
-    state.appendCheckedSha(gitDir, head)
+    // "attempted" now so a re-fire does not resubmit; "completed" only once the
+    // findings are in hand, so a failed run leaves this commit's lines in scope.
+    state.appendCheckedSha(gitDir, head, "attempted")
     log(`submitted run ${run.id} for ${head} (base ${base}, ${stats.files.length} files)`)
 
     let finalRun: Run
@@ -188,6 +220,7 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
     } catch (err) {
         return notifyPerCommit("findings-fetch-failed", `Amplify Console: run finished but findings for commit ${head.slice(0, 7)} could not be fetched (${describe(err)}).`)
     }
+    state.appendCheckedSha(gitDir, head, "completed")
     const kept = filterToScope(findings, scope)
     log(`run ${run.id}: ${findings.length} findings, ${kept.length} in scope (scope from ${scopeFrom.slice(0, 7)})`)
     for (const f of findings) {
@@ -212,7 +245,7 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
 type Prelude =
     | { kind: "skip" }
     | { kind: "unconfigured"; problem: string }
-    | { kind: "ready"; dryRun: boolean; config: Config | null; cwd: string; gitDir: string; head: string; checked: Set<string> }
+    | { kind: "ready"; dryRun: boolean; config: Config | null; cwd: string; gitDir: string; head: string; checked: state.CheckedShas }
 
 /**
  * Everything both commit hooks agree on before doing anything visible: was this
@@ -221,7 +254,11 @@ type Prelude =
  */
 async function commitPrelude(input: HookInput, env: Record<string, string | undefined>, log: (m: string) => void, now: () => number = Date.now): Promise<Prelude> {
     const command = input.tool_input?.command
-    if (typeof command !== "string" || !GIT_COMMIT_RE.test(command)) return { kind: "skip" }
+    const dirs = typeof command === "string" ? commitDirs(command) : null
+    if (dirs === null) return { kind: "skip" }
+    // `git -C <dir>` commits in <dir>, not in the hook's cwd; the hook's cwd may
+    // itself be another repository (a multi-repo workspace).
+    const startDir = dirs.reduce((dir, next) => resolve(dir, next), input.cwd)
 
     // A dry run needs no credentials: it stops before the first API call.
     const dryRun = isDryRun(env)
@@ -229,18 +266,18 @@ async function commitPrelude(input: HookInput, env: Record<string, string | unde
     if (!configResult.ok && !dryRun) return { kind: "unconfigured", problem: configResult.problem }
     const config = configResult.ok ? configResult.config : null
 
-    const gitDir = await git.gitDir(input.cwd)
+    const gitDir = await git.gitDir(startDir)
     if (!gitDir) return { kind: "skip" }
     // Diffs are computed with the repo root as cwd, not the hook's cwd: git
     // pathspecs (used to exclude binaries from the diff) resolve relative to
     // cwd, so a hook firing from a subdirectory would silently scope the diff
     // to that subdirectory otherwise.
-    const cwd = await git.repoRoot(input.cwd)
+    const cwd = await git.repoRoot(startDir)
     if (!cwd) return { kind: "skip" }
     const head = await git.headSha(cwd)
     if (!head) return { kind: "skip" }
     const checked = state.readCheckedShas(gitDir)
-    if (checked.has(head)) {
+    if (checked.all.has(head)) {
         log(`commit ${head} already checked`)
         return { kind: "skip" }
     }

@@ -95,14 +95,23 @@ export type PushedBase = { kind: "none-unpushed" } | { kind: "no-pushed-base" } 
  * against that repository, so a commit pushed only to a fork is not a base.
  */
 export async function pushedBase(cwd: string): Promise<PushedBase> {
-    const unpushed = await gitOut(cwd, ["rev-list", "HEAD", "--not", "--remotes=origin"])
-    if (unpushed === null) return { kind: "no-pushed-base" }
-    const commits = unpushed.split("\n").filter(Boolean)
-    if (commits.length === 0) return { kind: "none-unpushed" }
-    const oldest = commits[commits.length - 1]!
-    const parent = await gitOut(cwd, ["rev-parse", "--verify", "--quiet", `${oldest}^`])
-    if (parent === null) return { kind: "no-pushed-base" }
-    return { kind: "ok", baseSha: parent }
+    // `--boundary` lists, prefixed with `-`, the excluded commits adjacent to the
+    // unpushed ones: exactly the pushed parents. Taking "the parent of the last
+    // listed commit" instead would trust commit-date order, which merges and
+    // odd committer dates break.
+    const out = await gitOut(cwd, ["rev-list", "--boundary", "HEAD", "--not", "--remotes=origin"])
+    if (out === null) return { kind: "no-pushed-base" }
+    const lines = out.split("\n").filter(Boolean)
+    if (lines.length === 0) return { kind: "none-unpushed" }
+    const boundary = lines.find((line) => line.startsWith("-"))
+    if (!boundary) return { kind: "no-pushed-base" }
+    return { kind: "ok", baseSha: boundary.slice(1) }
+}
+
+/** Commits reachable from `tip` but not from `base`, newest first. */
+export async function range(cwd: string, base: string, tip: string): Promise<string[]> {
+    const out = await gitOut(cwd, ["rev-list", tip, `^${base}`])
+    return out === null ? [] : out.split("\n").filter(Boolean)
 }
 
 export interface DiffStats {

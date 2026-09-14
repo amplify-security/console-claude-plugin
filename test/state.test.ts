@@ -30,12 +30,23 @@ describe("state", () => {
 
     test("checked shas round-trip and cap at 500", () => {
         const gitDir = tmp()
-        expect(readCheckedShas(gitDir).size).toBe(0)
-        for (let i = 0; i < 510; i++) appendCheckedSha(gitDir, `sha${i}`)
+        expect(readCheckedShas(gitDir).all.size).toBe(0)
+        for (let i = 0; i < 510; i++) appendCheckedSha(gitDir, `sha${i}`, "completed")
         const shas = readCheckedShas(gitDir)
-        expect(shas.size).toBe(500)
-        expect(shas.has("sha509")).toBe(true)
-        expect(shas.has("sha9")).toBe(false)
+        expect(shas.all.size).toBe(500)
+        expect(shas.all.has("sha509")).toBe(true)
+        expect(shas.all.has("sha9")).toBe(false)
+    })
+
+    test("attempted and completed are tracked separately, and lines from before the status column count as completed", () => {
+        const gitDir = tmp()
+        appendCheckedSha(gitDir, "sha_failed", "attempted")
+        appendCheckedSha(gitDir, "sha_ok", "attempted")
+        appendCheckedSha(gitDir, "sha_ok", "completed")
+        appendFileSync(join(gitDir, "amplify-checked-shas"), "sha_legacy\t2020-01-01T00:00:00.000Z\n")
+        const shas = readCheckedShas(gitDir)
+        expect([...shas.all].sort()).toEqual(["sha_failed", "sha_legacy", "sha_ok"])
+        expect([...shas.completed].sort()).toEqual(["sha_legacy", "sha_ok"])
     })
 
     test("repo cache round-trips and tolerates corruption", () => {
@@ -52,16 +63,16 @@ describe("state", () => {
 
     test("appendCheckedSha only appends, so it can't clobber a line written by a concurrent hook invocation", () => {
         const gitDir = tmp()
-        appendCheckedSha(gitDir, "sha_a")
+        appendCheckedSha(gitDir, "sha_a", "completed")
         // Simulate another process's concurrent append landing between ours: unlike a
         // read-modify-write, appendCheckedSha never reads the file first, so it can't
         // stomp on this when it writes its own next line.
-        appendFileSync(join(gitDir, "amplify-checked-shas"), "sha_b\t2020-01-01T00:00:00.000Z\n")
-        appendCheckedSha(gitDir, "sha_c")
+        appendFileSync(join(gitDir, "amplify-checked-shas"), "sha_b\t2020-01-01T00:00:00.000Z\tcompleted\n")
+        appendCheckedSha(gitDir, "sha_c", "completed")
         const shas = readCheckedShas(gitDir)
-        expect(shas.has("sha_a")).toBe(true)
-        expect(shas.has("sha_b")).toBe(true)
-        expect(shas.has("sha_c")).toBe(true)
+        expect(shas.all.has("sha_a")).toBe(true)
+        expect(shas.all.has("sha_b")).toBe(true)
+        expect(shas.all.has("sha_c")).toBe(true)
     })
 
     test("writeRepoCache and writeOrgCache write via rename, leaving no temp file behind", () => {

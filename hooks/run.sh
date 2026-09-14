@@ -8,7 +8,7 @@
 set -u
 
 TRIGGER="${1:-}"
-DATA_DIR="${CLAUDE_PLUGIN_DATA:-${HOME:-}/.claude/plugins/data/console}"
+DATA_DIR="${CLAUDE_PLUGIN_DATA:-${HOME:-}/.claude/plugins/data/console-amplify-security}"
 
 find_bun() {
     if command -v bun >/dev/null 2>&1; then command -v bun; return 0; fi
