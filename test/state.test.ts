@@ -1,0 +1,84 @@
+import { describe, expect, test } from "bun:test"
+import { appendFileSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import {
+    appendCheckedSha,
+    dataDir,
+    firstTimeThisSession,
+    readCheckedShas,
+    readRepoCache,
+    writeOrgCache,
+    writeRepoCache,
+} from "../src/state.ts"
+
+const tmp = () => mkdtempSync(join(tmpdir(), "amplify-state-"))
+
+describe("state", () => {
+    test("dataDir honours CLAUDE_PLUGIN_DATA", () => {
+        expect(dataDir({ CLAUDE_PLUGIN_DATA: "/x" })).toBe("/x")
+        expect(dataDir({})).toContain("console")
+    })
+
+    test("firstTimeThisSession is true once per session and key", () => {
+        const dir = tmp()
+        expect(firstTimeThisSession(dir, "s1", "unconfigured")).toBe(true)
+        expect(firstTimeThisSession(dir, "s1", "unconfigured")).toBe(false)
+        expect(firstTimeThisSession(dir, "s1", "other")).toBe(true)
+        expect(firstTimeThisSession(dir, "s2", "unconfigured")).toBe(true)
+    })
+
+    test("checked shas round-trip and cap at 500", () => {
+        const gitDir = tmp()
+        expect(readCheckedShas(gitDir).all.size).toBe(0)
+        for (let i = 0; i < 510; i++) appendCheckedSha(gitDir, `sha${i}`, "completed")
+        const shas = readCheckedShas(gitDir)
+        expect(shas.all.size).toBe(500)
+        expect(shas.all.has("sha509")).toBe(true)
+        expect(shas.all.has("sha9")).toBe(false)
+    })
+
+    test("attempted and completed are tracked separately, and lines from before the status column count as completed", () => {
+        const gitDir = tmp()
+        appendCheckedSha(gitDir, "sha_failed", "attempted")
+        appendCheckedSha(gitDir, "sha_ok", "attempted")
+        appendCheckedSha(gitDir, "sha_ok", "completed")
+        appendFileSync(join(gitDir, "amplify-checked-shas"), "sha_legacy\t2020-01-01T00:00:00.000Z\n")
+        const shas = readCheckedShas(gitDir)
+        expect([...shas.all].sort()).toEqual(["sha_failed", "sha_legacy", "sha_ok"])
+        expect([...shas.completed].sort()).toEqual(["sha_legacy", "sha_ok"])
+    })
+
+    test("repo cache round-trips and tolerates corruption", () => {
+        const gitDir = tmp()
+        expect(readRepoCache(gitDir)).toBeNull()
+        writeRepoCache(gitDir, { repoUrl: "https://github.com/o/r.git", orgId: "org_1", projectId: "p1" })
+        expect(readRepoCache(gitDir)).toEqual({ repoUrl: "https://github.com/o/r.git", orgId: "org_1", projectId: "p1" })
+        // An entry from before the cache was keyed by organization is treated as absent.
+        writeFileSync(join(gitDir, "amplify-console.json"), JSON.stringify({ repoUrl: "https://github.com/o/r.git", projectId: "p1" }))
+        expect(readRepoCache(gitDir)).toBeNull()
+        writeFileSync(join(gitDir, "amplify-console.json"), "{not json")
+        expect(readRepoCache(gitDir)).toBeNull()
+    })
+
+    test("appendCheckedSha only appends, so it can't clobber a line written by a concurrent hook invocation", () => {
+        const gitDir = tmp()
+        appendCheckedSha(gitDir, "sha_a", "completed")
+        // Simulate another process's concurrent append landing between ours: unlike a
+        // read-modify-write, appendCheckedSha never reads the file first, so it can't
+        // stomp on this when it writes its own next line.
+        appendFileSync(join(gitDir, "amplify-checked-shas"), "sha_b\t2020-01-01T00:00:00.000Z\tcompleted\n")
+        appendCheckedSha(gitDir, "sha_c", "completed")
+        const shas = readCheckedShas(gitDir)
+        expect(shas.all.has("sha_a")).toBe(true)
+        expect(shas.all.has("sha_b")).toBe(true)
+        expect(shas.all.has("sha_c")).toBe(true)
+    })
+
+    test("writeRepoCache and writeOrgCache write via rename, leaving no temp file behind", () => {
+        const gitDir = tmp()
+        writeRepoCache(gitDir, { repoUrl: "https://github.com/o/r.git", orgId: "org_1", projectId: "p1" })
+        writeOrgCache(gitDir, { apiUrl: "https://api.test", keyFingerprint: "abc", orgId: "org_1", orgName: "Org" })
+        expect(readdirSync(gitDir).sort()).toEqual(["amplify-console.json", "org.json"])
+    })
+})

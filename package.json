@@ -1,0 +1,16 @@
+{
+  "name": "console-claude-plugin",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude Code plugin that runs Amplify detections against Claude-written commits.",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "validate": "claude plugin validate ."
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "amplify-security",
+  "description": "Claude Code plugins from Amplify Security.",
+  "owner": {
+    "name": "Amplify Security",
+    "url": "https://amplify.security"
+  },
+  "plugins": [
+    {
+      "name": "console",
+      "description": "Runs your organization's Amplify security detections against code Claude commits, and feeds findings back into the session for Claude to fix or triage.",
+      "source": "./",
+      "category": "security",
+      "homepage": "https://amplify.security"
+    }
+  ]
+}

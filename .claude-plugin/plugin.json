@@ -1,0 +1,43 @@
+{
+  "name": "console",
+  "displayName": "Amplify Console",
+  "version": "0.2.0",
+  "description": "Runs your organization's Amplify security detections against code Claude commits, and feeds findings back into the session for Claude to fix or triage.",
+  "author": {
+    "name": "Amplify Security",
+    "url": "https://amplify.security"
+  },
+  "license": "MIT",
+  "keywords": ["security", "detections", "amplify", "console", "sast"],
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "Amplify API key",
+      "description": "API key issued by Amplify. Sent as a bearer token.",
+      "sensitive": true
+    },
+    "org_id": {
+      "type": "string",
+      "title": "Amplify organization ID",
+      "description": "Leave blank if your API key belongs to exactly one organization; it is detected automatically. Otherwise the plugin lists your organizations and asks you to pick one."
+    },
+    "api_url": {
+      "type": "string",
+      "title": "Amplify API URL",
+      "description": "Base URL of the Amplify API. Leave the default unless Amplify told you otherwise.",
+      "default": "https://agent.console.prod.amplify.security"
+    },
+    "tenant_url": {
+      "type": "string",
+      "title": "Amplify tenant service URL",
+      "description": "Base URL of the Amplify account service, used only to list your organizations when org_id is blank. Leave the default unless Amplify told you otherwise.",
+      "default": "https://tenant.console.prod.amplify.security"
+    },
+    "cadence": {
+      "type": "string",
+      "title": "Check cadence",
+      "description": "When to run detections. Only \"commit\" is supported today.",
+      "default": "commit"
+    }
+  }
+}
