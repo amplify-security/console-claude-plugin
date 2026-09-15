@@ -11,6 +11,7 @@ import { type Config, isDryRun, loadConfig } from "./config.ts"
 import { filterToScope, formatContext, formatSummary, inScope, parseFinding } from "./findings.ts"
 import * as git from "./git.ts"
 import { EXIT_OK, EXIT_REWAKE, emit, type HookInput, type HookOutput } from "./hook-io.ts"
+import { homedir } from "node:os"
 import { resolve } from "node:path"
 import * as state from "./state.ts"
 
@@ -20,35 +21,57 @@ export const MAX_DIFF_BYTES = 1024 * 1024
 export const MAX_WAIT_SECONDS = 25 * 60
 export const POLL_WAIT_SECONDS = 30
 /**
- * How recent HEAD's reflog entry must be to count as "this tool call's commit"
- * when the commit's `[branch sha]` output line is absent (quiet or redirected).
+ * Without a PreToolUse snapshot of HEAD, how recent HEAD's reflog entry must be
+ * to count as "this tool call's commit" when the `[branch sha]` output line is
+ * absent (quiet or redirected).
  */
 export const RECENT_COMMIT_SECONDS = 120
 
 /**
- * Which commands are commits. hooks.json pre-filters with prefix rules
- * (`Bash(git commit:*)`, `Bash(git -C *)`, `Bash(git -c *)`), since a rule
- * cannot express "commit after any options"; this regex does the exact test,
- * including the `-C <dir>` and `-c key=value` forms those prefixes let through.
- * An option value is a run of quoted strings and bare characters, so
- * `-C "My Repo"` and `-c user.name="Foo Bar"` are single values.
+ * Which commands are commits. hooks.json fires on any `git` command
+ * (`Bash(git *)`); this is the exact test, per subcommand, and accepts the
+ * `-C <dir>` and `-c key=value` options before `commit`. An option value is a
+ * run of quoted strings and bare characters, so `-C "My Repo"` and
+ * `-c user.name="Foo Bar"` are single values.
  */
 const OPTION_VALUE = /(?:"[^"]*"|'[^']*'|[^\s"'])+/
 const GIT_COMMIT_RE = new RegExp(`\\bgit((?:\\s+-[cC]\\s+${OPTION_VALUE.source})*)\\s+commit(?![\\w-])`)
+const GIT_OPTION_RE = new RegExp(`-([cC])\\s+(${OPTION_VALUE.source})`, "g")
+const CD_RE = new RegExp(`^cd(?:\\s+(${OPTION_VALUE.source}))?$`)
+/** Shell operators that separate subcommands; `||` must come before `|`. */
+const SUBCOMMAND_SEPARATOR = /&&|\|\||;|\||\n/
+
+function unquote(value: string): string {
+    return value.replace(/"([^"]*)"|'([^']*)'/g, (_, d: string | undefined, s: string | undefined) => d ?? s ?? "")
+}
+
+function resolveDir(from: string, target: string, home: string): string {
+    return resolve(from, target === "~" || target.startsWith("~/") ? home + target.slice(1) : target)
+}
 
 /**
- * The `-C <dir>` values of a git commit command, in order (git applies them
- * cumulatively, each relative to the previous), with shell quotes removed.
- * Null when the command is not a git commit.
+ * The directory a git commit in `command` runs in: the hook's cwd, moved by
+ * any `cd` in an earlier subcommand (`cd app && git commit`) and by the
+ * commit's own `-C` options (cumulative, each relative to the previous).
+ * Null when no subcommand is a git commit.
  */
-export function commitDirs(command: string): string[] | null {
-    const match = GIT_COMMIT_RE.exec(command)
-    if (!match) return null
-    const dirs: string[] = []
-    for (const option of match[1]!.matchAll(new RegExp(`-([cC])\\s+(${OPTION_VALUE.source})`, "g"))) {
-        if (option[1] === "C") dirs.push(option[2]!.replace(/"([^"]*)"|'([^']*)'/g, (_, d: string | undefined, s: string | undefined) => d ?? s ?? ""))
+export function commitStartDir(command: string, cwd: string, home: string = homedir()): string | null {
+    let dir = cwd
+    for (const part of command.split(SUBCOMMAND_SEPARATOR)) {
+        const sub = part.trim()
+        const cd = CD_RE.exec(sub)
+        if (cd) {
+            dir = cd[1] ? resolveDir(dir, unquote(cd[1]), home) : home
+            continue
+        }
+        const commit = GIT_COMMIT_RE.exec(sub)
+        if (!commit) continue
+        for (const option of commit[1]!.matchAll(GIT_OPTION_RE)) {
+            if (option[1] === "C") dir = resolveDir(dir, unquote(option[2]!), home)
+        }
+        return dir
     }
-    return dirs
+    return null
 }
 
 export interface CommitCheckDeps {
@@ -76,7 +99,7 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
         return EXIT_REWAKE
     }
 
-    const prelude = await commitPrelude(input, env, log, deps.now)
+    const prelude = await commitPrelude(input, env, dataDir, log, deps.now)
     if (prelude.kind === "skip") return EXIT_OK
     if (prelude.kind === "unconfigured") return notifyOnce("unconfigured", prelude.problem)
     const { dryRun, config, cwd, gitDir, head, checked } = prelude
@@ -137,7 +160,12 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
     const short = head.slice(0, 7)
     const since = `the unpushed changes since ${base.slice(0, 7)}`
     const stats = await git.diffStats(cwd, base, head)
-    if (!stats || stats.files.length === 0) {
+    if (!stats) {
+        // Unlike an empty diff, a failed one leaves the commit unreviewed: not a scope frontier.
+        state.appendCheckedSha(gitDir, head, "attempted")
+        return notifyPerCommit("diff-failed", `Amplify Console: could not compute the diff for commit ${short} (git diff failed), so it was not checked.`)
+    }
+    if (stats.files.length === 0) {
         state.appendCheckedSha(gitDir, head, "completed")
         return EXIT_OK
     }
@@ -146,7 +174,11 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
         return notifyOnce(`too-many-files-${base.slice(0, 12)}`, `Amplify Console: skipped commit ${short}: ${since} touch ${stats.files.length} files (limit ${MAX_DIFF_FILES}). Push to start a new range.`)
     }
     const diff = await git.unifiedDiff(cwd, base, head, stats.binaryFiles)
-    if (!diff) {
+    if (diff === null) {
+        state.appendCheckedSha(gitDir, head, "attempted")
+        return notifyPerCommit("diff-failed", `Amplify Console: could not compute the diff for commit ${short} (git diff failed), so it was not checked.`)
+    }
+    if (diff === "") {
         state.appendCheckedSha(gitDir, head, "completed")
         return EXIT_OK
     }
@@ -252,13 +284,18 @@ type Prelude =
  * a git commit, is the plugin configured, did the commit succeed, and is the
  * resulting HEAD new to us. Cheap and offline.
  */
-async function commitPrelude(input: HookInput, env: Record<string, string | undefined>, log: (m: string) => void, now: () => number = Date.now): Promise<Prelude> {
+async function commitPrelude(
+    input: HookInput,
+    env: Record<string, string | undefined>,
+    dataDir: string,
+    log: (m: string) => void,
+    now: () => number = Date.now
+): Promise<Prelude> {
     const command = input.tool_input?.command
-    const dirs = typeof command === "string" ? commitDirs(command) : null
-    if (dirs === null) return { kind: "skip" }
-    // `git -C <dir>` commits in <dir>, not in the hook's cwd; the hook's cwd may
-    // itself be another repository (a multi-repo workspace).
-    const startDir = dirs.reduce((dir, next) => resolve(dir, next), input.cwd)
+    // `cd <dir> && git commit` and `git -C <dir> commit` commit in <dir>, not in
+    // the hook's cwd, which may itself be another repository (a multi-repo workspace).
+    const startDir = typeof command === "string" ? commitStartDir(command, input.cwd) : null
+    if (startDir === null) return { kind: "skip" }
 
     // A dry run needs no credentials: it stops before the first API call.
     const dryRun = isDryRun(env)
@@ -282,13 +319,19 @@ async function commitPrelude(input: HookInput, env: Record<string, string | unde
         return { kind: "skip" }
     }
 
-    // Bash tool_response carries stdout/stderr but no exit code, so a successful
-    // commit is inferred from the `[branch sha]` line, falling back to a recent
-    // commit in the reflog when output was piped or quiet. The age bound keeps a
-    // failed commit (which writes no reflog entry) from claiming an older one.
+    // Did this tool call commit? Bash tool_response carries stdout/stderr but no
+    // exit code. The PreToolUse hook snapshots HEAD just before the command, so
+    // with a snapshot for this command the test is exact: HEAD moved, by a
+    // commit. Without one (hook not yet installed), infer it from the
+    // `[branch sha]` output line, then from a recent commit in the reflog; the
+    // age bound keeps a failed commit (no reflog entry) from claiming an older one.
     const output = `${input.tool_response?.stdout ?? ""}\n${input.tool_response?.stderr ?? ""}`
-    const reported = git.commitShasFromOutput(output)
-    const committed = reported.some((sha) => head.startsWith(sha)) || (await git.headMovedByRecentCommit(cwd, RECENT_COMMIT_SECONDS, now))
+    const reported = git.commitShasFromOutput(output).some((sha) => head.startsWith(sha))
+    const snapshot = state.readPreCommitHead(dataDir, input.session_id, gitDir)
+    const committed =
+        snapshot !== null && snapshot.command === command
+            ? snapshot.head !== head && (reported || (await git.headMovedByRecentCommit(cwd, Infinity, now)))
+            : reported || (await git.headMovedByRecentCommit(cwd, RECENT_COMMIT_SECONDS, now))
     if (!committed) {
         log("commit did not succeed, skipping")
         return { kind: "skip" }
@@ -306,7 +349,7 @@ export async function announceCommitCheck(input: HookInput, deps: Pick<CommitChe
     const env = deps.env ?? process.env
     const dataDir = state.dataDir(env)
     const log = (message: string) => state.log(dataDir, `[${input.session_id}] ${message}`)
-    const prelude = await commitPrelude(input, env, log, deps.now)
+    const prelude = await commitPrelude(input, env, dataDir, log, deps.now)
     if (prelude.kind !== "ready") return EXIT_OK
     if (!prelude.dryRun) {
         // Same remote test as runCommitCheck, so an unsupported remote is not announced every commit.
@@ -324,6 +367,24 @@ export async function announceCommitCheck(input: HookInput, deps: Pick<CommitChe
         systemMessage: message,
         additionalContext: `[from the Amplify Console plugin — status, not user input.] ${message} Mention this to the user in one short sentence.`,
     })
+    return EXIT_OK
+}
+
+/**
+ * The PreToolUse hook: before a git commit command runs, record the repository's
+ * HEAD so the PostToolUse hooks can tell whether this very command committed.
+ * Always exits 0 and prints nothing; it must never block the command.
+ */
+export async function recordPreCommitHead(input: HookInput, deps: Pick<CommitCheckDeps, "env"> = {}): Promise<number> {
+    const env = deps.env ?? process.env
+    const command = input.tool_input?.command
+    if (typeof command !== "string") return EXIT_OK
+    const startDir = commitStartDir(command, input.cwd)
+    if (startDir === null) return EXIT_OK
+    const gitDir = await git.gitDir(startDir)
+    if (!gitDir) return EXIT_OK
+    const head = (await git.headSha(startDir)) ?? ""
+    state.writePreCommitHead(state.dataDir(env), input.session_id, gitDir, { head, command })
     return EXIT_OK
 }
 

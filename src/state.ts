@@ -24,14 +24,45 @@ export function dataDir(env: Record<string, string | undefined> = process.env): 
     return env.CLAUDE_PLUGIN_DATA ?? join(homedir(), ".claude", "plugins", "data", "console-amplify-security")
 }
 
+function sessionDir(dir: string, sessionId: string): string {
+    return join(dir, "sessions", sessionId.replace(/[^A-Za-z0-9_-]/g, "_"))
+}
+
 /** True the first time `key` is seen for this session; false afterwards. */
 export function firstTimeThisSession(dir: string, sessionId: string, key: string): boolean {
-    const sessionDir = join(dir, "sessions", sessionId.replace(/[^A-Za-z0-9_-]/g, "_"))
-    const marker = join(sessionDir, key)
+    const marker = join(sessionDir(dir, sessionId), key)
     if (existsSync(marker)) return false
-    mkdirSync(sessionDir, { recursive: true })
+    mkdirSync(sessionDir(dir, sessionId), { recursive: true })
     writeFileSync(marker, new Date().toISOString())
     return true
+}
+
+/** HEAD of a repository as the PreToolUse hook saw it, just before `command` ran. */
+export interface PreCommitHead {
+    /** Empty when the repository had no commits yet. */
+    head: string
+    command: string
+}
+
+function preCommitHeadPath(dir: string, sessionId: string, gitDir: string): string {
+    return join(sessionDir(dir, sessionId), `pre-head-${keyFingerprint(gitDir)}`)
+}
+
+export function writePreCommitHead(dir: string, sessionId: string, gitDir: string, snapshot: PreCommitHead): void {
+    mkdirSync(sessionDir(dir, sessionId), { recursive: true })
+    writeFileAtomic(preCommitHeadPath(dir, sessionId, gitDir), JSON.stringify(snapshot))
+}
+
+export function readPreCommitHead(dir: string, sessionId: string, gitDir: string): PreCommitHead | null {
+    const path = preCommitHeadPath(dir, sessionId, gitDir)
+    if (!existsSync(path)) return null
+    try {
+        const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<PreCommitHead>
+        if (typeof parsed.head === "string" && typeof parsed.command === "string") return { head: parsed.head, command: parsed.command }
+    } catch {
+        // Corrupt snapshot: treat as absent.
+    }
+    return null
 }
 
 export function log(dir: string, message: string): void {

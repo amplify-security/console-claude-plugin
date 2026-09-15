@@ -14,6 +14,7 @@ import {
     pushedBase,
     repoRoot,
     unifiedDiff,
+    unquotePath,
 } from "../src/git.ts"
 import { fixtureRepo, run, tmp } from "./helpers.ts"
 
@@ -87,6 +88,15 @@ describe("parseAddedLines", () => {
     test("strips the TAB git appends after a path containing whitespace", () => {
         const diff = ["--- a/my file.ts\t", "+++ b/my file.ts\t", "@@ -0,0 +1 @@", "+x"].join("\n")
         expect([...parseAddedLines(diff).keys()]).toEqual(["my file.ts"])
+    })
+
+    test("undoes the C-style quoting git applies to paths with quotes, backslashes or control characters", () => {
+        expect(unquotePath('"b/src/we\\"ird.ts"')).toBe('b/src/we"ird.ts')
+        expect(unquotePath('"b/a\\\\b\\tc.ts"')).toBe("b/a\\b\tc.ts")
+        expect(unquotePath('"b/caf\\303\\251.ts"')).toBe("b/café.ts")
+        expect(unquotePath("b/plain.ts")).toBe("b/plain.ts")
+        const diff = ['--- "a/we\\"ird.ts"', '+++ "b/we\\"ird.ts"', "@@ -0,0 +1 @@", "+x"].join("\n")
+        expect([...parseAddedLines(diff).keys()]).toEqual(['we"ird.ts'])
     })
 })
 
@@ -203,6 +213,18 @@ describe("repository operations", () => {
         const lines = (await addedLines(repo.work, repo.first, head))!
         expect([...lines.keys()].sort()).toEqual(["my file.ts", "src/y.ts"])
         expect([...lines.get("my file.ts")!]).toEqual([1, 2])
+    })
+
+    test("scope keys use the real path for a file name git has to quote", async () => {
+        const repo = fixtureRepo()
+        const head = repo.commit({ 'we"ird.ts': "x\n" }, "quoted")
+        const lines = (await addedLines(repo.work, repo.first, head))!
+        expect([...lines.keys()]).toEqual(['we"ird.ts'])
+    })
+
+    test("git helpers return null for a directory that does not exist instead of throwing", async () => {
+        expect(await gitDir("/nonexistent/dir/from/a/cd")).toBeNull()
+        expect(await repoRoot("/nonexistent/dir/from/a/cd")).toBeNull()
     })
 
     test("headMovedByRecentCommit accepts a fresh commit and rejects a stale or non-commit reflog entry", async () => {

@@ -5,7 +5,7 @@
  * Any unexpected failure is logged and exits 0: a hook must never make the
  * user's commit look broken.
  */
-import { announceCommitCheck, runCommitCheck } from "./commit.ts"
+import { announceCommitCheck, recordPreCommitHead, runCommitCheck } from "./commit.ts"
 import { EXIT_OK, outputFlushed, readHookInput } from "./hook-io.ts"
 import { dataDir, log } from "./state.ts"
 
@@ -18,6 +18,8 @@ try {
         exitCode = await runCommitCheck(input)
     } else if (trigger === "commit-start") {
         exitCode = await announceCommitCheck(input)
+    } else if (trigger === "commit-pre") {
+        exitCode = await recordPreCommitHead(input)
     } else {
         log(dataDir(), `unknown trigger "${trigger}"`)
     }

@@ -18,8 +18,18 @@ const GIT_CONFIG = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/nul
 /** Force the `a/` `b/` header prefixes the server's `git apply` expects, whatever the user's `diff.noprefix` / `diff.mnemonicPrefix`. */
 const DIFF_PREFIX = ["--src-prefix=a/", "--dst-prefix=b/"]
 
+/** The spawned process, or the spawn error's message: a cwd that does not exist (from a `cd` in the command) fails here, not in git. */
+function spawnGit(cwd: string, args: string[]) {
+    try {
+        return Bun.spawn(["git", ...GIT_CONFIG, ...args], { cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore" })
+    } catch (err) {
+        return err instanceof Error ? err.message : String(err)
+    }
+}
+
 export async function git(cwd: string, args: string[]): Promise<GitResult> {
-    const proc = Bun.spawn(["git", ...GIT_CONFIG, ...args], { cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore" })
+    const proc = spawnGit(cwd, args)
+    if (typeof proc === "string") return { code: 1, stdout: "", stderr: proc }
     const [stdout, stderr, code] = await Promise.all([
         new Response(proc.stdout).text(),
         new Response(proc.stderr).text(),
@@ -164,7 +174,7 @@ export function parseAddedLines(diff: string): Map<string, Set<number>> {
         }
         if (line.startsWith("+++ ")) {
             // git appends a TAB after a path that contains whitespace.
-            const target = line.slice(4).split("\t")[0]!
+            const target = unquotePath(line.slice(4).split("\t")[0]!)
             if (target === "/dev/null") {
                 current = null
                 continue
@@ -183,6 +193,24 @@ export function parseAddedLines(diff: string): Map<string, Set<number>> {
         }
     }
     return result
+}
+
+const C_ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 }
+
+/**
+ * Undo git's C-style path quoting (`"a\"b\t\303\251"`). Even with
+ * core.quotePath=false, paths containing `"`, `\` or control characters are
+ * quoted, and the escapes are bytes of the UTF-8 encoding.
+ */
+export function unquotePath(target: string): string {
+    if (target.length < 2 || !target.startsWith('"') || !target.endsWith('"')) return target
+    const bytes: number[] = []
+    for (const token of target.slice(1, -1).matchAll(/\\([0-7]{1,3})|\\(.)|([^\\]+)/g)) {
+        if (token[1] !== undefined) bytes.push(parseInt(token[1], 8))
+        else if (token[2] !== undefined) bytes.push(C_ESCAPES[token[2]] ?? token[2].charCodeAt(0))
+        else bytes.push(...Buffer.from(token[3]!, "utf8"))
+    }
+    return Buffer.from(bytes).toString("utf8")
 }
 
 /** Commit SHAs that the shell output of a `git commit` reports, e.g. `[main abc1234] msg`. */

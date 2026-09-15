@@ -35,18 +35,20 @@ describe("hooks/run.sh", () => {
         expect(existsSync(join(dataDir, "dry-run"))).toBe(false)
     })
 
-    test("without Bun, only the synchronous commit-start hook prints the install reminder", async () => {
+    test("without Bun, only the synchronous commit-start hook, and only for a commit, prints the install reminder", async () => {
         const dataDir = tmp()
         const env: Record<string, string> = { CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT, CLAUDE_PLUGIN_DATA: dataDir, PATH: "/usr/bin:/bin", HOME: tmp() }
-        const runHook = async (trigger: string) => {
-            const proc = Bun.spawn(["bash", join(PLUGIN_ROOT, "hooks", "run.sh"), trigger], { env, stdin: new Blob(["{}"]), stdout: "pipe", stderr: "pipe" })
+        const runHook = async (trigger: string, command: string) => {
+            const payload = JSON.stringify({ session_id: "s", cwd: "/", tool_name: "Bash", tool_input: { command } })
+            const proc = Bun.spawn(["bash", join(PLUGIN_ROOT, "hooks", "run.sh"), trigger], { env, stdin: new Blob([payload]), stdout: "pipe", stderr: "pipe" })
             const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
             return { stdout, code }
         }
-        // The async hook runs in parallel with the sync one and must not consume the once-a-day marker.
-        const asyncHook = await runHook("commit")
-        expect(asyncHook).toEqual({ stdout: "", code: 0 })
-        const syncHook = await runHook("commit-start")
+        // The hook is gated on any git command: a non-commit must not consume the once-a-day marker.
+        expect(await runHook("commit-start", "git -C packages/api log --oneline")).toEqual({ stdout: "", code: 0 })
+        // The async hook runs in parallel with the sync one and must not consume it either.
+        expect(await runHook("commit", 'git commit -m "x"')).toEqual({ stdout: "", code: 0 })
+        const syncHook = await runHook("commit-start", 'cd app && git commit -m "x"')
         expect(syncHook.code).toBe(0)
         expect(syncHook.stdout).toContain("Bun is not installed")
     })

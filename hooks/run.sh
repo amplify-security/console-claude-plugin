@@ -22,6 +22,9 @@ BUN="$(find_bun)" || {
     # Only the synchronous commit-start hook can show this: both hooks run in
     # parallel for one commit, and an asyncRewake hook's exit-0 output is dropped.
     [ "$TRIGGER" = "commit-start" ] || exit 0
+    # The hook is gated on `Bash(git *)`, so this runs for every git command;
+    # only a commit (the payload is JSON on stdin) warrants the reminder.
+    grep -qE 'git([[:space:]]+-[cC][[:space:]]+[^[:space:]]+)*[[:space:]]+commit([^[:alnum:]_-]|$)' || exit 0
     mkdir -p "$DATA_DIR" 2>/dev/null
     marker="$DATA_DIR/bun-missing-notified"
     if [ -z "$(find "$marker" -mtime -1 2>/dev/null)" ]; then

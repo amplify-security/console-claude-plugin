@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { join } from "node:path"
-import { announceCommitCheck, commitDirs, MAX_DIFF_FILES, runCommitCheck } from "../src/commit.ts"
+import { announceCommitCheck, commitStartDir, MAX_DIFF_FILES, recordPreCommitHead, runCommitCheck } from "../src/commit.ts"
 import type { HookInput } from "../src/hook-io.ts"
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
-import { readCheckedShas } from "../src/state.ts"
+import { gitDir } from "../src/git.ts"
+import { readCheckedShas, readPreCommitHead } from "../src/state.ts"
 import { fixtureRepo, run, tmp } from "./helpers.ts"
 
 const env = (dataDir: string, extra: Record<string, string> = {}) => ({
@@ -85,15 +86,26 @@ async function capture<T>(fn: () => Promise<T>): Promise<{ result: T; out: strin
 
 const fast = { now: Date.now, sleep: async () => {} }
 
-describe("commitDirs", () => {
-    test("recognizes a commit after -C/-c options, quoted or not, and returns the -C directories", () => {
-        expect(commitDirs("git commit -m x")).toEqual([])
-        expect(commitDirs('git -C "/Users/me/My Repo" commit -m x')).toEqual(["/Users/me/My Repo"])
-        expect(commitDirs("git -c user.name='Foo Bar' -C sub commit")).toEqual(["sub"])
-        expect(commitDirs('git -c user.name="Foo Bar" commit -m x')).toEqual([])
-        expect(commitDirs("git -C a -C b commit")).toEqual(["a", "b"])
-        expect(commitDirs("git status")).toBeNull()
-        expect(commitDirs("git commit-tree HEAD^{tree} -m x")).toBeNull()
+describe("commitStartDir", () => {
+    const cwd = "/work"
+    test("recognizes a commit after -C/-c options, quoted or not, and applies the -C directories", () => {
+        expect(commitStartDir("git commit -m x", cwd)).toBe("/work")
+        expect(commitStartDir('git -C "/Users/me/My Repo" commit -m x', cwd)).toBe("/Users/me/My Repo")
+        expect(commitStartDir("git -c user.name='Foo Bar' -C sub commit", cwd)).toBe("/work/sub")
+        expect(commitStartDir('git -c user.name="Foo Bar" commit -m x', cwd)).toBe("/work")
+        expect(commitStartDir("git -C a -C b commit", cwd)).toBe("/work/a/b")
+    })
+    test("follows a cd in an earlier subcommand", () => {
+        expect(commitStartDir("cd app && git add -A && git commit -m x", cwd)).toBe("/work/app")
+        expect(commitStartDir('cd "my app"; git commit -m x', cwd)).toBe("/work/my app")
+        expect(commitStartDir("cd /elsewhere && cd sub && git -C deeper commit", cwd)).toBe("/elsewhere/sub/deeper")
+        expect(commitStartDir("cd ~/proj && git commit -m x", cwd, "/home/me")).toBe("/home/me/proj")
+        expect(commitStartDir("cd && git commit -m x", cwd, "/home/me")).toBe("/home/me")
+    })
+    test("returns null when no subcommand is a git commit", () => {
+        expect(commitStartDir("git status", cwd)).toBeNull()
+        expect(commitStartDir("cd app && git status", cwd)).toBeNull()
+        expect(commitStartDir("git commit-tree HEAD^{tree} -m x", cwd)).toBeNull()
     })
 })
 
@@ -475,6 +487,51 @@ describe("runCommitCheck", () => {
         expect(server.calls.find((c) => c.url.endsWith("/api/runs"))!.body).toMatchObject({ source: { baseSha: repo.first } })
         expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(true)
         expect(existsSync(join(workspace, ".git", "amplify-checked-shas"))).toBe(false)
+    })
+
+    test("`cd <repo> && git commit` is checked against <repo>, not the hook's cwd", async () => {
+        const repo = fixtureRepo()
+        const head = repo.commit({ "d.ts": "x\n" }, "d")
+        const workspace = tmp()
+        run(workspace, ["git", "init", "-q"])
+        const server = fakeServer()
+        const hook: HookInput = { ...input(workspace, head), tool_input: { command: `cd ${repo.work} && git add -A && git commit -m d` } }
+        const { result } = await capture(() => runCommitCheck(hook, { env: env(tmp()), fetchImpl: server.fetchImpl, ...fast }))
+        expect(result).toBe(0)
+        expect(server.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(true)
+        expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(true)
+    })
+
+    test("with a PreToolUse snapshot, a quiet commit is checked even after a slow trailing step", async () => {
+        const repo = fixtureRepo()
+        const dataDir = tmp()
+        const command = "git commit -q -m s && bun test"
+        const quiet = (head: string): HookInput => ({ ...input(repo.work, head), tool_input: { command }, tool_response: { stdout: "" } })
+
+        // PreToolUse: HEAD is still the first commit.
+        expect(await recordPreCommitHead(quiet(repo.first), { env: env(dataDir) })).toBe(0)
+        expect(readPreCommitHead(dataDir, "s1", (await gitDir(repo.work))!)).toEqual({ head: repo.first, command })
+        const head = repo.commit({ "s.ts": "x\n" }, "s")
+        // PostToolUse, ten minutes later (the trailing step was slow): HEAD moved during this call, so it counts.
+        const server = fakeServer()
+        const { result } = await capture(() => runCommitCheck(quiet(head), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast, now: () => Date.now() + 10 * 60 * 1000 }))
+        expect(result).toBe(0)
+        expect(server.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(true)
+    })
+
+    test("with a PreToolUse snapshot, a commit the user made just before Claude's failed one is not claimed", async () => {
+        const repo = fixtureRepo()
+        const dataDir = tmp()
+        const head = repo.commit({ "u.ts": "x\n" }, "user commit") // seconds ago, by the user
+        const command = "git commit -m x"
+        const failed: HookInput = { ...input(repo.work, head), tool_input: { command }, tool_response: { stdout: "nothing to commit, working tree clean" } }
+        await recordPreCommitHead(failed, { env: env(dataDir) }) // HEAD is already the user's commit
+        const server = fakeServer()
+        const { result, out } = await capture(() => runCommitCheck(failed, { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
+        expect(result).toBe(0)
+        expect(out).toBe("")
+        expect(server.calls).toHaveLength(0)
+        expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(false)
     })
 
     test("the size limits cover the whole unpushed range and are reported once per base", async () => {
