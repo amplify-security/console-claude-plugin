@@ -32,8 +32,6 @@ export const TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "
 export interface Run {
     id: string
     status: RunStatus
-    /** Server-side failure text, set when status is "error". */
-    error: string | null
 }
 
 /** A finding row as served by GET /api/findings. `raw` is the SARIF-shaped payload. */
@@ -156,14 +154,16 @@ export class AmplifyApi {
             source: { baseSha: input.baseSha, diff: input.diff },
         })
         if (!isRecord(data) || typeof data.runId !== "string") throw new ApiError(202, undefined, "unexpected run shape")
-        return { id: data.runId, status: statusOf(data), error: null }
+        return { id: data.runId, status: statusOf(data) }
     }
 
     /** Long-poll a run: the server holds the request (at most 30s) until terminal or `waitSeconds` elapse. */
     async getRun(runId: string, waitSeconds: number): Promise<Run> {
         const data = await this.request("GET", `/api/runs/${encodeURIComponent(runId)}?wait=${waitSeconds}`, undefined, {}, POLL_TIMEOUT_MS)
         if (!isRecord(data) || typeof data.status !== "string") throw new ApiError(200, undefined, "unexpected run shape")
-        return { id: runId, status: statusOf(data), error: typeof data.error === "string" ? data.error : null }
+        // The response also carries `error`, the server's failure text. It is not read: it can name
+        // infrastructure, and nothing the plugin writes (notice or log) may repeat text a server sent.
+        return { id: runId, status: statusOf(data) }
     }
 
     async listFindings(runId: string): Promise<Finding[]> {

@@ -28,13 +28,24 @@ function sessionDir(dir: string, sessionId: string): string {
     return join(dir, "sessions", sessionId.replace(/[^A-Za-z0-9_-]/g, "_"))
 }
 
-/** True the first time `key` is seen for this session; false afterwards. */
-export function firstTimeThisSession(dir: string, sessionId: string, key: string): boolean {
-    const marker = join(sessionDir(dir, sessionId), key)
-    if (existsSync(marker)) return false
+/**
+ * Remember a problem a network call found that every later commit this session
+ * would hit alike, with the one-line reason to repeat for those commits. The
+ * synchronous hook reads it back so it can report instead of announcing.
+ */
+export function rememberProblem(dir: string, sessionId: string, key: string, reason: string): void {
     mkdirSync(sessionDir(dir, sessionId), { recursive: true })
-    writeFileSync(marker, new Date().toISOString())
-    return true
+    writeFileAtomic(join(sessionDir(dir, sessionId), key), reason)
+}
+
+export function rememberedProblem(dir: string, sessionId: string, key: string): string | null {
+    const marker = join(sessionDir(dir, sessionId), key)
+    if (!existsSync(marker)) return null
+    try {
+        return readFileSync(marker, "utf8").trim() || null
+    } catch {
+        return null
+    }
 }
 
 /** HEAD of a repository as the PreToolUse hook saw it, just before `command` ran. */
@@ -65,10 +76,19 @@ export function readPreCommitHead(dir: string, sessionId: string, gitDir: string
     return null
 }
 
+/**
+ * Where the detail behind every user-facing notice ends up. The log is on the
+ * user's machine and readable by them: it records what the plugin did, with run
+ * ids and HTTP statuses for correlation, and never text a server sent.
+ */
+export function logPath(dir: string): string {
+    return join(dir, "log.txt")
+}
+
 export function log(dir: string, message: string): void {
     try {
         mkdirSync(dir, { recursive: true })
-        appendFileSync(join(dir, "log.txt"), `${new Date().toISOString()} ${message}\n`)
+        appendFileSync(logPath(dir), `${new Date().toISOString()} ${message}\n`)
     } catch {
         // Logging must never break a hook.
     }

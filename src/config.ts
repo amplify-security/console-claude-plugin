@@ -5,7 +5,7 @@
  * CLAUDE_PLUGIN_OPTION_<KEY>), with plain AMPLIFY_* environment variables as
  * a fallback for users who prefer shell configuration. Missing required values
  * are reported, not thrown: a PostToolUse hook that fails every commit would
- * be hostile, so the caller warns once per session and exits 0 instead.
+ * be hostile, so the caller tells the user the commit was not checked and why.
  */
 
 export interface Config {
@@ -18,7 +18,7 @@ export interface Config {
     cadence: string
 }
 
-/** `problem` is the full user-facing notice explaining what is wrong. */
+/** `problem` is the user-facing reason no check can run, phrased to follow "commit X was not checked." */
 export type ConfigResult = { ok: true; config: Config } | { ok: false; problem: string }
 
 const CADENCES = ["commit"]
@@ -58,8 +58,8 @@ export function loadConfig(env: Env = process.env): ConfigResult {
         return {
             ok: false,
             problem:
-                `Amplify Console: cadence is set to "${cadence}", but only ${CADENCES.map((c) => `"${c}"`).join(", ")} is supported, so detections did not run. ` +
-                `Fix it in /plugin configure console@amplify-security, or unset AMPLIFY_CADENCE.`,
+                `The plugin's cadence is set to "${cadence}", but only ${CADENCES.map((c) => `"${c}"`).join(", ")} is supported. ` +
+                `Fix it in /plugin configure console@amplify-security or unset AMPLIFY_CADENCE, then start a new Claude Code session.`,
         }
     }
 
@@ -77,8 +77,8 @@ export function loadConfig(env: Env = process.env): ConfigResult {
 
 export function describeMissingConfig(missing: string[]): string {
     return (
-        `Amplify Console is not configured (missing: ${missing.join(", ")}), so detections did not run. ` +
-        `Configure the plugin in /plugin, or set ${missing.map((m) => `AMPLIFY_${m.toUpperCase()}`).join(", ")} in your shell.`
+        `The plugin is not configured (missing ${missing.join(", ")}). ` +
+        `Set ${missing.map((m) => `AMPLIFY_${m.toUpperCase()}`).join(", ")} in the shell that launches Claude Code, or reinstall with \`claude plugin install console@amplify-security --config ${missing.map((m) => `${m}=<value>`).join(" --config ")}\`, then start a new Claude Code session.`
     )
 }
 

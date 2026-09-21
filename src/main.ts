@@ -2,8 +2,9 @@
  * Hook entry point. `hooks/run.sh` invokes this as `bun run src/main.ts <trigger>`
  * with the Claude Code hook payload on stdin.
  *
- * Any unexpected failure is logged and exits 0: a hook must never make the
- * user's commit look broken.
+ * An unexpected failure before a check was announced is logged and exits 0: a
+ * hook must never make the user's commit look broken, and nothing was promised
+ * yet. Once a check is announced, `runCommitCheck` owns the failure and reports it.
  */
 import { announceCommitCheck, recordPreCommitHead, runCommitCheck } from "./commit.ts"
 import { EXIT_OK, outputFlushed, readHookInput } from "./hook-io.ts"

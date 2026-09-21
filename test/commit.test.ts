@@ -134,7 +134,7 @@ describe("runCommitCheck", () => {
         expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(true)
     })
 
-    test("uses the parent as base after `git commit && git push`, and a clean commit is silent", async () => {
+    test("uses the parent as base after `git commit && git push`, and reports a clean commit with a one-line wake", async () => {
         const repo = fixtureRepo()
         const head = repo.commit({ "b.ts": "x\n" }, "b")
         repo.push()
@@ -142,10 +142,12 @@ describe("runCommitCheck", () => {
         const { result, out } = await capture(() =>
             runCommitCheck(input(repo.work, head), { env: env(tmp()), fetchImpl: server.fetchImpl, ...fast })
         )
-        expect(result).toBe(0)
+        expect(result).toBe(2)
         expect(server.calls.find((c) => c.url.endsWith("/api/runs"))!.body).toMatchObject({ source: { baseSha: repo.first } })
-        // Exit-0 output from the asyncRewake hook is never shown, so nothing is emitted.
-        expect(out).toBe("")
+        const output = JSON.parse(out.trim())
+        expect(output.rewakeSummary).toBe(`Amplify Console: no findings in commit ${head.slice(0, 7)}`)
+        expect(plain(output.hookSpecificOutput.additionalContext)).toContain("found nothing")
+        expect(output.hookSpecificOutput.additionalContext).toContain("Tell the user in one sentence")
     })
 
     test("resolves the repo root when the hook fires from a subdirectory, so the diff isn't scoped to it", async () => {
@@ -167,20 +169,29 @@ describe("runCommitCheck", () => {
 
     /** The additionalContext of the single JSON line the hook printed. */
     const noticeOf = (out: string) => JSON.parse(out.trim()).hookSpecificOutput?.additionalContext as string | undefined
+    const shownBy = (out: string) => JSON.parse(out.trim()).systemMessage as string
+    /** A user-facing message names no run id, HTTP status or code, URL, run status, server error or git command. */
+    const INTERNALS = /run_\w+|HTTP|https?:\/\/|status "|git \w+|NOT_FOUND|INTERNAL|fetch failed|did not apply/
+    const plain = (text: string | undefined): string => {
+        expect(text).toBeDefined()
+        expect(text).not.toMatch(INTERNALS)
+        return text!
+    }
 
-    test("warns once per session when unconfigured, via the rewake channel, and never calls the API", async () => {
+    test("an unconfigured plugin is reported by the synchronous hook on every commit; the background hook stays quiet and never calls the API", async () => {
         const repo = fixtureRepo()
-        const head = repo.commit({ "c.ts": "x\n" }, "c")
         const server = fakeServer()
-        const dataDir = tmp()
-        const bare = { CLAUDE_PLUGIN_DATA: dataDir }
-        const first = await capture(() => runCommitCheck(input(repo.work, head), { env: bare, fetchImpl: server.fetchImpl, ...fast }))
-        const second = await capture(() => runCommitCheck(input(repo.work, head), { env: bare, fetchImpl: server.fetchImpl, ...fast }))
-        expect(first.result).toBe(2)
-        expect(noticeOf(first.out)).toContain("not configured")
-        expect(noticeOf(first.out)).toContain("Relay this to the user")
-        expect(second.result).toBe(0)
-        expect(second.out).toBe("")
+        const bare = { CLAUDE_PLUGIN_DATA: tmp() }
+        for (const name of ["c", "c2"]) {
+            const head = repo.commit({ [`${name}.ts`]: "x\n" }, name)
+            const start = await capture(() => announceCommitCheck(input(repo.work, head), { env: bare }))
+            const shown = plain(shownBy(start.out))
+            expect(shown).toContain(`commit ${head.slice(0, 7)} was not checked. The plugin is not configured`)
+            expect(shown).toContain("AMPLIFY_API_KEY")
+            expect(JSON.parse(start.out.trim()).hookSpecificOutput.additionalContext).toContain("Mention this to the user")
+            const check = await capture(() => runCommitCheck(input(repo.work, head), { env: bare, fetchImpl: server.fetchImpl, ...fast }))
+            expect(check).toEqual({ result: 0, out: "" })
+        }
         expect(server.calls).toHaveLength(0)
     })
 
@@ -192,32 +203,43 @@ describe("runCommitCheck", () => {
         const notProject = fakeServer({ project: null })
         const a = await capture(() => runCommitCheck(input(repo.work, head), { env: env(dataDir), fetchImpl: notProject.fetchImpl, ...fast }))
         expect(a.result).toBe(2)
-        expect(noticeOf(a.out)).toContain("not onboarded")
+        expect(plain(noticeOf(a.out))).toContain("not onboarded")
         expect(notProject.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(false)
+        // The problem is remembered for the session: the synchronous hook now reports it and the background hook makes no further calls.
+        const again = await capture(() => announceCommitCheck(input(repo.work, head), { env: env(dataDir) }))
+        expect(plain(shownBy(again.out))).toContain(`commit ${head.slice(0, 7)} was not checked. This repository is not onboarded`)
+        const lookups = notProject.calls.length
+        expect(await capture(() => runCommitCheck(input(repo.work, head), { env: env(dataDir), fetchImpl: notProject.fetchImpl, ...fast }))).toEqual({ result: 0, out: "" })
+        expect(notProject.calls).toHaveLength(lookups)
 
         const server = fakeServer()
-        const failed: HookInput = { ...input(repo.work, head), tool_response: { stdout: "", stderr: "nothing to commit" } }
+        const failed: HookInput = { ...input(repo.work, head, "s2"), tool_response: { stdout: "", stderr: "nothing to commit" } }
         run(repo.work, ["git", "reset", "-q", "--soft", "HEAD"]) // make the reflog's last entry a reset, not a commit
         const b = await capture(() => runCommitCheck(failed, { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
         expect(b.result).toBe(0)
         expect(server.calls).toHaveLength(0)
 
-        const c = await capture(() => runCommitCheck(input(repo.work, head), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
-        expect(c.result).toBe(0) // clean run, marks checked
-        const d = await capture(() => runCommitCheck(input(repo.work, head), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
+        const c = await capture(() => runCommitCheck(input(repo.work, head, "s2"), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
+        expect(c.result).toBe(2) // clean run, marks checked
+        expect(JSON.parse(c.out.trim()).rewakeSummary).toContain("no findings")
+        const d = await capture(() => runCommitCheck(input(repo.work, head, "s2"), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
         expect(d.out).toBe("")
         expect(server.calls.filter((x) => x.url.endsWith("/api/runs"))).toHaveLength(1)
     })
 
-    test("a failed run is reported once through the rewake channel, without findings", async () => {
+    test("a failed run is reported through the rewake channel without findings, and the server's error text reaches neither the notice nor the log", async () => {
         const repo = fixtureRepo()
         const head = repo.commit({ "e.ts": "x\n" }, "e")
         const server = fakeServer({ statuses: ["error"] })
+        const dataDir = tmp()
         const { result, out } = await capture(() =>
-            runCommitCheck(input(repo.work, head), { env: env(tmp()), fetchImpl: server.fetchImpl, ...fast })
+            runCommitCheck(input(repo.work, head), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast })
         )
         expect(result).toBe(2)
-        expect(noticeOf(out)).toContain('status "error" (diff did not apply cleanly)')
+        expect(plain(noticeOf(out))).toContain(`the check for commit ${head.slice(0, 7)} failed. The run did not complete on Amplify's side`)
+        const log = readFileSync(join(dataDir, "log.txt"), "utf8")
+        expect(log).toContain('run run_1 ended with status "error"')
+        expect(log).not.toContain("did not apply")
     })
 
     test("a mid-poll failure (not a terminal run status) is reported through the rewake channel, not swallowed", async () => {
@@ -235,8 +257,46 @@ describe("runCommitCheck", () => {
         const { result, out } = await capture(() => runCommitCheck(input(repo.work, head), { env: env(tmp()), fetchImpl, ...fast }))
         expect(result).toBe(2)
         expect(pollCalls).toBeGreaterThanOrEqual(5) // waitForRun gives up after 5 consecutive poll failures
-        expect(noticeOf(out)).toContain("lost track of run")
-        expect(noticeOf(out)).toContain("fetch failed")
+        expect(plain(noticeOf(out))).toContain("Amplify stopped answering while the run was in progress. Amplify could not be reached")
+    })
+
+    test("a run that never finishes is reported as failed once the wait deadline passes", async () => {
+        const repo = fixtureRepo()
+        const head = repo.commit({ "slow.ts": "x\n" }, "slow")
+        const base = fakeServer({ statuses: ["running"] })
+        const clock = { t: 1_000_000_000 }
+        const fetchImpl: FakeServer["fetchImpl"] = async (url, init) => {
+            if (new URL(url).pathname.startsWith("/api/runs/")) clock.t += 10 * 60 * 1000
+            return base.fetchImpl(url, init)
+        }
+        const { result, out } = await capture(() =>
+            runCommitCheck(input(repo.work, head), { env: env(tmp()), fetchImpl, now: () => clock.t, sleep: async () => {} })
+        )
+        expect(result).toBe(2)
+        expect(plain(noticeOf(out))).toContain("did not finish within 25 minutes")
+    })
+
+    test("an unexpected error after the check was announced is reported as a failed check, not swallowed", async () => {
+        const repo = fixtureRepo()
+        const head = repo.commit({ "boom.ts": "x\n" }, "boom")
+        const dataDir = tmp()
+        writeFileSync(join(dataDir, "dry-run"), "a file where the dry-run directory should be")
+        const { result, out } = await capture(() => runCommitCheck(input(repo.work, head), { env: { CLAUDE_PLUGIN_DATA: dataDir, AMPLIFY_DRY_RUN: "1" }, ...fast }))
+        expect(result).toBe(2)
+        expect(plain(noticeOf(out))).toContain(`the check for commit ${head.slice(0, 7)} failed. The plugin hit an unexpected error`)
+        expect(readFileSync(join(dataDir, "log.txt"), "utf8")).toContain("unhandled error")
+    })
+
+    test("a commit with nothing Amplify can check is reported as such, and counts as reviewed", async () => {
+        const repo = fixtureRepo()
+        const head = repo.commit({ "img.bin": "\0\0\0" }, "binary only")
+        const dataDir = tmp()
+        const start = await capture(() => announceCommitCheck(input(repo.work, head), { env: env(dataDir) }))
+        expect(plain(shownBy(start.out))).toContain(`commit ${head.slice(0, 7)} has no changes Amplify can check`)
+        const server = fakeServer()
+        expect(await capture(() => runCommitCheck(input(repo.work, head), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))).toEqual({ result: 0, out: "" })
+        expect(server.calls).toHaveLength(0)
+        expect(readCheckedShas(join(repo.work, ".git")).completed.has(head)).toBe(true)
     })
 
     test("ignores non-commit commands, including plumbing subcommands like commit-tree", async () => {
@@ -254,14 +314,14 @@ describe("runCommitCheck", () => {
         const head = repo.commit({ "src/a.ts": "line1\n" }, "a")
         const server = fakeServer()
         const semicolon: HookInput = { ...input(repo.work, head), tool_input: { command: "git commit;echo done" } }
-        expect(await runCommitCheck(semicolon, { env: env(tmp()), fetchImpl: server.fetchImpl, ...fast })).toBe(0)
+        expect(await capture(() => runCommitCheck(semicolon, { env: env(tmp()), fetchImpl: server.fetchImpl, ...fast }))).toMatchObject({ result: 2 })
         expect(server.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(true)
 
         const repo2 = fixtureRepo()
         const head2 = repo2.commit({ "src/a.ts": "line1\n" }, "a")
         const server2 = fakeServer()
         const andand: HookInput = { ...input(repo2.work, head2), tool_input: { command: "git commit&&echo done" } }
-        expect(await runCommitCheck(andand, { env: env(tmp()), fetchImpl: server2.fetchImpl, ...fast })).toBe(0)
+        expect(await capture(() => runCommitCheck(andand, { env: env(tmp()), fetchImpl: server2.fetchImpl, ...fast }))).toMatchObject({ result: 2 })
         expect(server2.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(true)
     })
 
@@ -324,7 +384,7 @@ describe("runCommitCheck", () => {
         const server = fakeServer({ orgs: ["org_solo"] })
         const noOrgEnv = { CLAUDE_PLUGIN_DATA: dataDir, AMPLIFY_API_KEY: "key", AMPLIFY_API_URL: "https://api.test" }
         const { result } = await capture(() => runCommitCheck(input(repo.work, head), { env: noOrgEnv, fetchImpl: server.fetchImpl, ...fast }))
-        expect(result).toBe(0)
+        expect(result).toBe(2) // clean
         expect(server.calls[0]!.url).toContain("/v1.1/user/memberships")
         const submit = server.calls.find((c) => c.url.endsWith("/api/runs"))!
         expect((submit as unknown as { url: string }).url).toBeDefined()
@@ -342,16 +402,23 @@ describe("runCommitCheck", () => {
         const repo = fixtureRepo()
         const head = repo.commit({ "m.ts": "x\n" }, "m")
         const server = fakeServer({ orgs: ["org_a", "org_b"] })
-        const { result, out } = await capture(() =>
-            runCommitCheck(input(repo.work, head), { env: { CLAUDE_PLUGIN_DATA: tmp(), AMPLIFY_API_KEY: "key", AMPLIFY_API_URL: "https://api.test" }, fetchImpl: server.fetchImpl, ...fast })
-        )
+        const noOrg = { CLAUDE_PLUGIN_DATA: tmp(), AMPLIFY_API_KEY: "key", AMPLIFY_API_URL: "https://api.test" }
+        const { result, out } = await capture(() => runCommitCheck(input(repo.work, head), { env: noOrg, fetchImpl: server.fetchImpl, ...fast }))
         expect(result).toBe(2)
-        const notice = noticeOf(out)!
+        const notice = plain(noticeOf(out))
         expect(notice).toContain("2 organizations")
         expect(notice).toContain("ORG_A: org_a")
         expect(notice).toContain("ORG_B: org_b")
         expect(notice).toContain("/plugin configure")
         expect(server.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(false)
+
+        // From the next commit on, the synchronous hook repeats the reason and the background hook stays quiet and offline.
+        const next = repo.commit({ "m2.ts": "y\n" }, "m2")
+        const start = await capture(() => announceCommitCheck(input(repo.work, next), { env: noOrg }))
+        expect(plain(shownBy(start.out))).toContain(`commit ${next.slice(0, 7)} was not checked. Your API key belongs to 2 organizations`)
+        const calls = server.calls.length
+        expect(await capture(() => runCommitCheck(input(repo.work, next), { env: noOrg, fetchImpl: server.fetchImpl, ...fast }))).toEqual({ result: 0, out: "" })
+        expect(server.calls).toHaveLength(calls)
     })
 
     test("a commit that adds no lines re-surfaces nothing from earlier unpushed commits", async () => {
@@ -367,19 +434,18 @@ describe("runCommitCheck", () => {
         run(repo.work, ["git", "commit", "-q", "-m", "delete only"])
         const second = run(repo.work, ["git", "rev-parse", "HEAD"])
         const b = await capture(() => runCommitCheck(input(repo.work, second), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
-        expect(b.result).toBe(0)
-        expect(b.out).toBe("")
+        expect(b.result).toBe(2)
+        expect(JSON.parse(b.out.trim()).rewakeSummary).toBe(`Amplify Console: no findings in commit ${second.slice(0, 7)}`)
     })
 
     test("an unknown cadence is reported like any other misconfiguration", async () => {
         const repo = fixtureRepo()
         const head = repo.commit({ "cad.ts": "x\n" }, "cad")
         const server = fakeServer()
-        const { result, out } = await capture(() =>
-            runCommitCheck(input(repo.work, head), { env: env(tmp(), { AMPLIFY_CADENCE: "push" }), fetchImpl: server.fetchImpl, ...fast })
-        )
-        expect(result).toBe(2)
-        expect(noticeOf(out)).toContain('cadence is set to "push"')
+        const bad = env(tmp(), { AMPLIFY_CADENCE: "push" })
+        const start = await capture(() => announceCommitCheck(input(repo.work, head), { env: bad }))
+        expect(plain(shownBy(start.out))).toContain('was not checked. The plugin\'s cadence is set to "push"')
+        expect(await capture(() => runCommitCheck(input(repo.work, head), { env: bad, fetchImpl: server.fetchImpl, ...fast }))).toEqual({ result: 0, out: "" })
         expect(server.calls).toHaveLength(0)
     })
 
@@ -388,7 +454,7 @@ describe("runCommitCheck", () => {
         const dataDir = tmp()
         const base = fakeServer()
         const fetchImpl: FakeServer["fetchImpl"] = async (url, init) => {
-            if (new URL(url).pathname === "/api/runs") return new Response(JSON.stringify({ error: "INTERNAL" }), { status: 500 })
+            if (new URL(url).pathname === "/api/runs") return new Response(JSON.stringify({ error: "INTERNAL", message: "Snapshot console/sandbox-dev:feature is unavailable" }), { status: 500 })
             return base.fetchImpl(url, init)
         }
         const first = repo.commit({ "p.ts": "x\n" }, "p")
@@ -396,9 +462,13 @@ describe("runCommitCheck", () => {
         const second = repo.commit({ "q.ts": "y\n" }, "q")
         const b = await capture(() => runCommitCheck(input(repo.work, second), { env: env(dataDir), fetchImpl, ...fast }))
         expect(a.result).toBe(2)
-        expect(noticeOf(a.out)).toContain(`could not start a detections run for commit ${first.slice(0, 7)}`)
+        expect(plain(noticeOf(a.out))).toContain(`the check for commit ${first.slice(0, 7)} failed. The detections run could not be started. Amplify returned a server error`)
+        // The log keeps the status and error code for correlation, not the server's message body.
+        const log = readFileSync(join(dataDir, "log.txt"), "utf8")
+        expect(log).toContain("failed: HTTP 500 INTERNAL")
+        expect(log).not.toContain("snapshot is unavailable")
         expect(b.result).toBe(2)
-        expect(noticeOf(b.out)).toContain(`could not start a detections run for commit ${second.slice(0, 7)}`)
+        expect(plain(noticeOf(b.out))).toContain(`the check for commit ${second.slice(0, 7)} failed. The detections run could not be started`)
     })
 
     test("without the `[branch sha]` line, only a commit made moments ago counts; an older one is not Claude's", async () => {
@@ -417,7 +487,7 @@ describe("runCommitCheck", () => {
 
         const fresh = fakeServer()
         const b = await capture(() => runCommitCheck(quiet, { env: env(tmp()), fetchImpl: fresh.fetchImpl, ...fast }))
-        expect(b.result).toBe(0)
+        expect(b.result).toBe(2) // clean
         expect(fresh.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(true)
     })
 
@@ -444,7 +514,7 @@ describe("runCommitCheck", () => {
         const failing = fakeServer({ statuses: ["error"] })
         const a = await capture(() => runCommitCheck(input(repo.work, k1), { env: env(dataDir), fetchImpl: failing.fetchImpl, ...fast }))
         expect(a.result).toBe(2)
-        expect(noticeOf(a.out)).toContain('status "error"')
+        expect(plain(noticeOf(a.out))).toContain("did not complete on Amplify's side")
         const afterFailure = readCheckedShas(join(repo.work, ".git"))
         expect(afterFailure.all.has(k1)).toBe(true) // not resubmitted...
         expect(afterFailure.completed.has(k1)).toBe(false) // ...but not reviewed either
@@ -483,7 +553,7 @@ describe("runCommitCheck", () => {
         const server = fakeServer()
         const hook: HookInput = { ...input(workspace, head), tool_input: { command: `git -C "${repo.work}" commit -m c` } }
         const { result } = await capture(() => runCommitCheck(hook, { env: env(tmp()), fetchImpl: server.fetchImpl, ...fast }))
-        expect(result).toBe(0)
+        expect(result).toBe(2) // clean
         expect(server.calls.find((c) => c.url.endsWith("/api/runs"))!.body).toMatchObject({ source: { baseSha: repo.first } })
         expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(true)
         expect(existsSync(join(workspace, ".git", "amplify-checked-shas"))).toBe(false)
@@ -497,7 +567,7 @@ describe("runCommitCheck", () => {
         const server = fakeServer()
         const hook: HookInput = { ...input(workspace, head), tool_input: { command: `cd ${repo.work} && git add -A && git commit -m d` } }
         const { result } = await capture(() => runCommitCheck(hook, { env: env(tmp()), fetchImpl: server.fetchImpl, ...fast }))
-        expect(result).toBe(0)
+        expect(result).toBe(2) // clean
         expect(server.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(true)
         expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(true)
     })
@@ -515,7 +585,7 @@ describe("runCommitCheck", () => {
         // PostToolUse, ten minutes later (the trailing step was slow): HEAD moved during this call, so it counts.
         const server = fakeServer()
         const { result } = await capture(() => runCommitCheck(quiet(head), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast, now: () => Date.now() + 10 * 60 * 1000 }))
-        expect(result).toBe(0)
+        expect(result).toBe(2) // clean
         expect(server.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(true)
     })
 
@@ -534,23 +604,22 @@ describe("runCommitCheck", () => {
         expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(false)
     })
 
-    test("the size limits cover the whole unpushed range and are reported once per base", async () => {
+    test("the size limits cover the whole unpushed range; the synchronous hook reports every commit in it and the background hook stays quiet", async () => {
         const repo = fixtureRepo()
         const dataDir = tmp()
         const many = Object.fromEntries(Array.from({ length: MAX_DIFF_FILES + 1 }, (_, i) => [`gen/f${i}.ts`, `${i}\n`]))
-        const huge = repo.commit(many, "huge")
         const server = fakeServer()
-        const a = await capture(() => runCommitCheck(input(repo.work, huge), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
-        expect(a.result).toBe(2)
-        expect(noticeOf(a.out)).toContain(`skipped commit ${huge.slice(0, 7)}: the unpushed changes since ${repo.first.slice(0, 7)} touch ${MAX_DIFF_FILES + 1} files`)
-        expect(readCheckedShas(join(repo.work, ".git")).completed.has(huge)).toBe(false)
-
-        // A small follow-up commit is still over the limit (same range) and is not reported again.
-        const small = repo.commit({ "small.ts": "x\n" }, "small")
-        const b = await capture(() => runCommitCheck(input(repo.work, small), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
-        expect(b.result).toBe(0)
-        expect(b.out).toBe("")
-        expect(server.calls.some((c) => c.url.endsWith("/api/runs"))).toBe(false)
+        // The first commit is over the limit; a small follow-up commit still is, since the range is the same.
+        for (const [files, extra] of [[MAX_DIFF_FILES + 1, many], [MAX_DIFF_FILES + 2, { "small.ts": "x\n" }]] as const) {
+            const head = repo.commit(extra, `${files} files`)
+            const start = await capture(() => announceCommitCheck(input(repo.work, head), { env: env(dataDir) }))
+            expect(plain(shownBy(start.out))).toContain(`commit ${head.slice(0, 7)} was not checked. The unpushed changes now span ${files} files`)
+            expect(await capture(() => runCommitCheck(input(repo.work, head), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))).toEqual({ result: 0, out: "" })
+            const checked = readCheckedShas(join(repo.work, ".git"))
+            expect(checked.all.has(head)).toBe(true)
+            expect(checked.completed.has(head)).toBe(false)
+        }
+        expect(server.calls).toHaveLength(0)
     })
 
     test("a repository-specific notice is given for each repository a session commits in", async () => {
@@ -562,11 +631,11 @@ describe("runCommitCheck", () => {
         const server = fakeServer({ project: null })
         const first = await capture(() => runCommitCheck(input(a.work, headA), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
         const second = await capture(() => runCommitCheck(input(b.work, headB), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))
-        expect(noticeOf(first.out)).toContain("not onboarded")
-        expect(noticeOf(second.out)).toContain("not onboarded")
+        expect(plain(noticeOf(first.out))).toContain("not onboarded")
+        expect(plain(noticeOf(second.out))).toContain("not onboarded")
     })
 
-    test("the synchronous commit-start hook announces a check only when one will run", async () => {
+    test("the synchronous commit-start hook announces a check, or says why this commit gets none", async () => {
         const repo = fixtureRepo()
         const head = repo.commit({ "s.ts": "x\n" }, "s")
         const dataDir = tmp()
@@ -575,16 +644,13 @@ describe("runCommitCheck", () => {
         expect(eligible.result).toBe(0)
         const announced = JSON.parse(eligible.out.trim())
         expect(announced.systemMessage).toContain(`checking commit ${head.slice(0, 7)}`)
-        expect(announced.systemMessage).toContain("a clean result is silent")
+        expect(announced.systemMessage).toContain("the result will arrive in this session")
         expect(announced.hookSpecificOutput.additionalContext).toContain("Mention this to the user")
 
         const dry = await capture(() => announceCommitCheck(input(repo.work, head), { env: { CLAUDE_PLUGIN_DATA: dataDir, AMPLIFY_DRY_RUN: "1" } }))
         expect(JSON.parse(dry.out.trim()).systemMessage).toContain("dry run")
 
-        // Quiet when unconfigured (the background hook owns that notice), for non-commit
-        // commands, for a failed commit, and once the commit has been checked.
-        const unconfigured = await capture(() => announceCommitCheck(input(repo.work, head), { env: { CLAUDE_PLUGIN_DATA: dataDir } }))
-        expect(unconfigured.out).toBe("")
+        // Quiet for non-commit commands, for a failed commit, and once the commit has been checked.
         const notCommit = await capture(() => announceCommitCheck({ ...input(repo.work, head), tool_input: { command: "git status" } }, { env: env(dataDir) }))
         expect(notCommit.out).toBe("")
         run(repo.work, ["git", "reset", "-q", "--soft", "HEAD"])
@@ -594,11 +660,24 @@ describe("runCommitCheck", () => {
         const checked = await capture(() => announceCommitCheck(input(repo.work, head), { env: env(dataDir) }))
         expect(checked.out).toBe("")
 
-        // A remote the real check rejects (not a hosted URL) is not announced either.
+        // A remote the real check rejects (not a hosted URL) is reported instead of announced.
         const local = fixtureRepo()
         const localHead = local.commit({ "l.ts": "x\n" }, "l")
         run(local.work, ["git", "remote", "set-url", "origin", "/srv/git/app.git"])
         const unsupported = await capture(() => announceCommitCheck(input(local.work, localHead), { env: env(dataDir) }))
-        expect(unsupported.out).toBe("")
+        expect(plain(shownBy(unsupported.out))).toContain(`commit ${localHead.slice(0, 7)} was not checked. This repository has no hosted origin remote`)
+
+        // So is a repository nothing has been pushed from yet.
+        const fresh = tmp("fresh-")
+        run(fresh, ["git", "init", "-q", "-b", "main"])
+        run(fresh, ["git", "config", "user.email", "t@example.com"])
+        run(fresh, ["git", "config", "user.name", "Test"])
+        run(fresh, ["git", "remote", "add", "origin", "https://github.com/acme/fresh.git"])
+        writeFileSync(join(fresh, "f.ts"), "x\n")
+        run(fresh, ["git", "add", "-A"])
+        run(fresh, ["git", "commit", "-q", "-m", "f"])
+        const freshHead = run(fresh, ["git", "rev-parse", "HEAD"])
+        const unpushed = await capture(() => announceCommitCheck(input(fresh, freshHead), { env: env(dataDir) }))
+        expect(plain(shownBy(unpushed.out))).toContain(`commit ${freshHead.slice(0, 7)} was not checked. Nothing in this repository has been pushed yet`)
     })
 })

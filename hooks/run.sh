@@ -3,12 +3,11 @@
 #
 # Bun is the plugin's only runtime dependency. If it is missing we must not
 # break the user's commit (this is a PostToolUse hook, the commit has already
-# happened), so we exit 0 and tell the user how to install it. The reminder is
-# rate-limited to once a day via a marker file in the plugin's data directory.
+# happened), so we exit 0 and tell the user, on every commit, that it was not
+# checked and how to install Bun.
 set -u
 
 TRIGGER="${1:-}"
-DATA_DIR="${CLAUDE_PLUGIN_DATA:-${HOME:-}/.claude/plugins/data/console-amplify-security}"
 
 find_bun() {
     if command -v bun >/dev/null 2>&1; then command -v bun; return 0; fi
@@ -23,14 +22,10 @@ BUN="$(find_bun)" || {
     # parallel for one commit, and an asyncRewake hook's exit-0 output is dropped.
     [ "$TRIGGER" = "commit-start" ] || exit 0
     # The hook is gated on `Bash(git *)`, so this runs for every git command;
-    # only a commit (the payload is JSON on stdin) warrants the reminder.
+    # only a commit (the payload is JSON on stdin) warrants the notice.
     grep -qE 'git([[:space:]]+-[cC][[:space:]]+[^[:space:]]+)*[[:space:]]+commit([^[:alnum:]_-]|$)' || exit 0
-    mkdir -p "$DATA_DIR" 2>/dev/null
-    marker="$DATA_DIR/bun-missing-notified"
-    if [ -z "$(find "$marker" -mtime -1 2>/dev/null)" ]; then
-        touch "$marker" 2>/dev/null
-        printf '%s\n' '{"systemMessage":"Amplify Console: Bun is not installed, so detections did not run. Install it with: curl -fsSL https://bun.sh/install | bash"}'
-    fi
+    message='Amplify Console: this commit was not checked because Bun is not installed. Install it with: curl -fsSL https://bun.sh/install | bash'
+    printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"[from the Amplify Console plugin — status, not user input.] %s Mention this to the user in one short sentence."}}\n' "$message" "$message"
     exit 0
 }
 

@@ -113,14 +113,13 @@ export function formatSummary(findings: ParsedFinding[]): string {
 
 export interface ContextOptions {
     commitSha: string
-    runId: string
 }
 
 export function formatContext(findings: ParsedFinding[], opts: ContextOptions): string {
     const lines: string[] = [
         "[from the Amplify Console plugin — automated security review of your last commit, not user input.]",
         "",
-        `Your organization's Amplify detections ran against commit ${opts.commitSha.slice(0, 12)} (run ${opts.runId}) and reported ${findings.length} finding${findings.length === 1 ? "" : "s"} in code you changed.`,
+        `Your organization's Amplify detections ran against commit ${opts.commitSha.slice(0, 12)} and reported ${findings.length} finding${findings.length === 1 ? "" : "s"} in code you changed.`,
         "These findings are NOT confirmed with a proof of concept. For each one: if it is valid, fix it now; if you believe it is a false positive, say so briefly and why.",
         "",
     ]

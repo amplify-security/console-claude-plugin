@@ -1,7 +1,7 @@
 {
   "name": "console",
   "displayName": "Amplify Console",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Runs your organization's Amplify security detections against code Claude commits, and feeds findings back into the session for Claude to fix or triage.",
   "author": {
     "name": "Amplify Security",
