@@ -14,9 +14,11 @@ Each time Claude commits in a repository that is onboarded in Amplify, the plugi
 3. Wakes Claude with the results one to two minutes later. Claude fixes valid findings in place and
    explains any it disagrees with, then carries on with what you asked.
 
-Every commit gets exactly one follow-up: the findings, a one-line "no findings", or a one-line reason
-the commit was not checked and what to do about it. The check never blocks or fails a commit, and it
-runs in the background so the session stays responsive.
+Every commit in an onboarded repository gets exactly one follow-up: the findings, a one-line
+"no findings", or a one-line reason the commit was not checked and what to do about it. In a
+repository that is not onboarded in your organization, or has no hosted `origin` remote, the plugin
+stays silent; the log records why. The check never blocks or fails a commit, and it runs in the
+background so the session stays responsive.
 
 ## Requirements
 
@@ -79,9 +81,12 @@ project's baseline findings in the Amplify Console.
 
 Messages from the plugin start with "Amplify Console:" and are relayed by Claude. A commit that could
 not be checked says so on the commit itself, every time, with the reason and what to do; a check that
-started and failed is reported when it fails. Setup problems that Amplify reports, such as a repository
-that is not onboarded, are reported once and then repeated briefly on each later commit until you
-start a new Claude Code session.
+started and failed is reported when it fails. A key that belongs to no or several organizations is
+reported once in full and then briefly on each later commit until you start a new Claude Code session.
+
+A repository the plugin cannot check at all gets no message: one that is not onboarded as a project in
+your organization, or whose `origin` is not a hosted repository URL. Commits there are logged as not
+checked and nothing else happens. Onboard the repository, then start a new Claude Code session.
 
 | Message                                  | Meaning                                                                                       |
 |------------------------------------------|-----------------------------------------------------------------------------------------------|
@@ -89,9 +94,8 @@ start a new Claude Code session.
 | "was not checked. The plugin is not configured" | No API key. Set `AMPLIFY_API_KEY` or reinstall with `--config api_key=…`, then start a new session. |
 | "was not checked. The plugin's cadence is set to" | Only `commit` is supported. Set `cadence` back to `commit` or clear it.              |
 | "Your API key belongs to N organizations" | Pick one from the list and set `org_id`, then start a new session.                          |
-| "Your organizations could not be looked up" | Amplify's account service was unreachable or rejected the key. Set `org_id` to skip the lookup. |
-| "is not onboarded as a project"          | The repository's `origin` URL does not match a project in your organization. Onboard it, then start a new session. |
-| "has no hosted origin remote"            | `origin` is missing or is not a hosted repository URL.                                        |
+| "Your organizations could not be looked up" | Amplify's account service was unreachable or rejected the key; retried on the next commit. Set `org_id` to skip the lookup. |
+| "could not be looked up in Amplify"      | The project lookup failed (network or key); retried on the next commit.                       |
 | "Nothing in this repository has been pushed yet" | Push at least once so Amplify has a base commit to check out.                       |
 | "has no changes Amplify can check"       | The commit is empty or changes only binary files.                                             |
 | "The unpushed changes now span" / "now exceed" | All unpushed changes together exceed 300 files or 1 MiB. Push to start a new range.    |

@@ -36,6 +36,12 @@ export const MAX_DIFF_BYTES = 1024 * 1024
 export const MAX_WAIT_SECONDS = 25 * 60
 export const POLL_WAIT_SECONDS = 30
 /**
+ * How long the synchronous hook gives each lookup (organization, project)
+ * before deciding it cannot know whether a check will run. Its hook timeout is
+ * 30s and a commit must never feel slow because of the plugin.
+ */
+export const ANNOUNCE_LOOKUP_TIMEOUT_MS = 5_000
+/**
  * Without a PreToolUse snapshot of HEAD, how recent HEAD's reflog entry must be
  * to count as "this tool call's commit" when the `[branch sha]` output line is
  * absent (quiet or redirected).
@@ -148,9 +154,9 @@ function wake(summary: string, message: string, relay?: string): number {
     return EXIT_REWAKE
 }
 
-// ---- The offline verdict, shared by both hooks. ----
+// ---- The verdict, shared by both hooks. ----
 
-/** Where the check would start: everything decided before the first network call. */
+/** Where the check starts: everything decided before the run is submitted. */
 interface CheckPlan {
     dryRun: boolean
     config: Config | null
@@ -159,6 +165,9 @@ interface CheckPlan {
     head: string
     checked: state.CheckedShas
     repoUrl: string | null
+    /** Both empty in a dry run without a cached project. */
+    orgId: string
+    projectId: string
     base: string
     /** Set when a dry run had to invent a base the real run would not use. */
     baseFallback?: string
@@ -166,25 +175,46 @@ interface CheckPlan {
     diff: string
 }
 
+/** A problem every later commit this session would hit alike; see `state.rememberProblem`. */
+interface Remember {
+    key: string
+    reason: string
+}
+
 type Verdict =
-    /** Not a commit of Claude's, or one already dealt with: nothing to say. */
+    /**
+     * Nothing to say: not a commit of Claude's, one already dealt with, or a
+     * repository Amplify cannot check at all (no hosted remote, not onboarded).
+     * The last is deliberate silence: the plugin has nothing for this repository
+     * and should not say so on every commit. The log records it.
+     */
     | { kind: "ignore" }
     /** No check can run; `message` is the user-facing outcome. `record` is what to note against the commit, if anything. */
-    | { kind: "skip"; head: string; gitDir: string; message: string; record: state.CheckStatus | null }
+    | { kind: "skip"; head: string; gitDir: string; message: string; record: state.CheckStatus | null; remember?: Remember }
+    /** A lookup failed, so whether a check can run is unknown. */
+    | { kind: "unresolved"; head: string; message: string }
     | { kind: "check"; plan: CheckPlan }
 
-async function offlineVerdict(
+/**
+ * Everything both hooks agree on before a run is submitted: is this a commit
+ * of Claude's, can the diff be built, and does the repository belong to an
+ * Amplify project in the configured organization. The lookups behind the last
+ * question are cached (the organization per key, the project per repository),
+ * so after the first commit in a repository the verdict is offline.
+ */
+async function commitVerdict(
     input: HookInput,
-    env: Record<string, string | undefined>,
     dataDir: string,
     log: (m: string) => void,
-    now: () => number = Date.now
+    deps: CommitCheckDeps,
+    lookupTimeoutMs?: number
 ): Promise<Verdict> {
-    const prelude = await commitPrelude(input, env, dataDir, log, now)
+    const env = deps.env ?? process.env
+    const prelude = await commitPrelude(input, env, dataDir, log, deps.now)
     if (prelude.kind === "skip") return { kind: "ignore" }
     const { dryRun, config, cwd, gitDir, head, checked } = prelude
     const short = head.slice(0, 7)
-    const skip = (message: string, record: state.CheckStatus | null = null): Verdict => ({ kind: "skip", head, gitDir, message, record })
+    const skip = (message: string, record: state.CheckStatus | null = null, remember?: Remember): Verdict => ({ kind: "skip", head, gitDir, message, record, remember })
     if (prelude.problem) return skip(notChecked(short, prelude.problem))
 
     // A dry run tolerates what the real run cannot: no hosted remote and no
@@ -192,13 +222,19 @@ async function offlineVerdict(
     const remote = await git.originUrl(cwd)
     const repoUrl = remote ? git.normalizeRepoUrl(remote) : null
     if (!repoUrl && !dryRun) {
-        return skip(notChecked(short, "This repository has no hosted origin remote for Amplify to match a project against."))
+        log(`${head}: no hosted origin remote, so Amplify cannot match this repository to a project; not checked`)
+        return { kind: "ignore" }
     }
 
+    const notAProjectKey = `not-a-project-${state.keyFingerprint(gitDir)}`
     if (!dryRun) {
         // Problems a network call found earlier this session and that this commit would hit again.
-        const known = state.rememberedProblem(dataDir, input.session_id, "org-unresolved") ?? state.rememberedProblem(dataDir, input.session_id, `not-a-project-${state.keyFingerprint(gitDir)}`)
-        if (known) return skip(notChecked(short, known))
+        const orgProblem = state.rememberedProblem(dataDir, input.session_id, "org-unresolved")
+        if (orgProblem) return skip(notChecked(short, orgProblem))
+        if (state.rememberedProblem(dataDir, input.session_id, notAProjectKey)) {
+            log(`${head}: repository is not an Amplify project (remembered this session); not checked`)
+            return { kind: "ignore" }
+        }
     }
 
     let base = await resolveBase(cwd, head)
@@ -236,7 +272,40 @@ async function offlineVerdict(
         return skip(notChecked(short, `The unpushed changes now exceed ${MAX_DIFF_BYTES / 1024} KiB as a diff, more than Amplify checks at once. Push to start a new range.`), "attempted")
     }
 
-    return { kind: "check", plan: { dryRun, config, cwd, gitDir, head, checked, repoUrl, base, baseFallback, stats, diff } }
+    // Only now, with a diff worth sending, does the verdict go to the network:
+    // which organization, and is this repository one of its projects.
+    let orgId = config?.orgId ?? ""
+    let projectId = ""
+    if (dryRun) {
+        // No network in a dry run: use the cached project id if there is one.
+        const cached = state.readRepoCache(gitDir)
+        projectId = cached && cached.repoUrl === repoUrl ? cached.projectId : ""
+    } else {
+        let api = new AmplifyApi(config!, deps.fetchImpl, lookupTimeoutMs)
+        if (!orgId) {
+            const resolved = await resolveOrg(api, config!, dataDir, log)
+            if (!resolved.ok) {
+                if (resolved.kind === "failed") return { kind: "unresolved", head, message: resolved.message }
+                // A key with no or several organizations stays that way for the session.
+                return skip(notChecked(short, resolved.message), null, { key: "org-unresolved", reason: resolved.reason })
+            }
+            orgId = resolved.orgId
+            api = api.withOrg(orgId)
+        }
+        try {
+            projectId = await resolveProjectId(api, gitDir, repoUrl!, orgId)
+        } catch (err) {
+            log(`project lookup for ${repoUrl} failed: ${describe(err)}`)
+            return { kind: "unresolved", head, message: `This repository could not be looked up in Amplify. ${explain(err)} ${detailsIn(dataDir)}` }
+        }
+        if (!projectId) {
+            log(`${head}: ${repoUrl} is not an Amplify project in organization ${orgId}; not checked`)
+            state.rememberProblem(dataDir, input.session_id, notAProjectKey, "not an Amplify project")
+            return { kind: "ignore" }
+        }
+    }
+
+    return { kind: "check", plan: { dryRun, config, cwd, gitDir, head, checked, repoUrl, orgId, projectId, base, baseFallback, stats, diff } }
 }
 
 // ---- The hooks. ----
@@ -246,20 +315,27 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
     const dataDir = state.dataDir(env)
     const log = (message: string) => state.log(dataDir, `[${input.session_id}] ${message}`)
 
-    const verdict = await offlineVerdict(input, env, dataDir, log, deps.now)
+    const verdict = await commitVerdict(input, dataDir, log, deps)
     if (verdict.kind === "ignore") return EXIT_OK
     if (verdict.kind === "skip") {
         // The synchronous hook reached the same verdict, told the user, and recorded
         // the commit. Recording it here too would race that hook's read of the
-        // checked-commits file and could make it fall silent.
+        // checked-commits file and could make it fall silent. Remembering the
+        // problem is idempotent, and covers a synchronous hook that ran out of time.
+        if (verdict.remember) state.rememberProblem(dataDir, input.session_id, verdict.remember.key, verdict.remember.reason)
         log(`${verdict.head}: ${verdict.message}`)
         return EXIT_OK
+    }
+    if (verdict.kind === "unresolved") {
+        // The synchronous hook could not know either and said nothing; this is the outcome.
+        const short = verdict.head.slice(0, 7)
+        return wake(`Amplify Console: the check for commit ${short} failed`, checkFailed(short, verdict.message))
     }
 
     const { plan } = verdict
     const short = plan.head.slice(0, 7)
     try {
-        return await checkCommit(plan, input.session_id, dataDir, log, deps)
+        return await checkCommit(plan, dataDir, log, deps)
     } catch (err) {
         // The check was announced, so even a bug in the plugin owes the user an outcome.
         log(`unhandled error checking commit ${plan.head}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`)
@@ -267,45 +343,13 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
     }
 }
 
-/** Everything after the offline verdict: resolve the org and project, submit, wait, report. */
-async function checkCommit(plan: CheckPlan, sessionId: string, dataDir: string, log: (m: string) => void, deps: CommitCheckDeps): Promise<number> {
-    const { dryRun, config, cwd, gitDir, head, checked, repoUrl, base, stats, diff } = plan
+/** Everything after the verdict: submit the run, wait for it, report. */
+async function checkCommit(plan: CheckPlan, dataDir: string, log: (m: string) => void, deps: CommitCheckDeps): Promise<number> {
+    const { dryRun, config, cwd, gitDir, head, checked, repoUrl, orgId, projectId, base, stats, diff } = plan
     const short = head.slice(0, 7)
     const failed = (reason: string): number => wake(`Amplify Console: the check for commit ${short} failed`, checkFailed(short, reason))
-    const skipped = (reason: string): number => wake(`Amplify Console: commit ${short} was not checked`, notChecked(short, reason))
-
     // A dry run never touches the network, so it gets no client.
-    let api = config && !dryRun ? new AmplifyApi(config, deps.fetchImpl) : null
-    let orgId = config?.orgId ?? ""
-    if (api && config && !orgId) {
-        const resolved = await resolveOrg(api, config, dataDir, log)
-        if (!resolved.ok) {
-            // A key with no or several organizations stays that way for the session; a failed lookup may be transient, so it is retried.
-            if (resolved.kind === "skipped") state.rememberProblem(dataDir, sessionId, "org-unresolved", resolved.reason)
-            return resolved.kind === "failed" ? failed(resolved.message) : skipped(resolved.message)
-        }
-        orgId = resolved.orgId
-        api = api.withOrg(orgId)
-    }
-    let projectId: string
-    if (dryRun) {
-        // No network in a dry run: use the cached project id if there is one.
-        const cached = state.readRepoCache(gitDir)
-        projectId = cached && cached.repoUrl === repoUrl ? cached.projectId : ""
-    } else {
-        try {
-            projectId = await resolveProjectId(api!, gitDir, repoUrl!, orgId)
-        } catch (err) {
-            log(`project lookup for ${repoUrl} failed: ${describe(err)}`)
-            return failed(`This repository could not be looked up in Amplify. ${explain(err)} ${detailsIn(dataDir)}`)
-        }
-    }
-    if (!projectId && !dryRun) {
-        log(`${repoUrl} is not an Amplify project in organization ${orgId}`)
-        const reason = `This repository is not onboarded as a project in your Amplify organization. Onboard it in the Amplify Console, ${NEW_SESSION}.`
-        state.rememberProblem(dataDir, sessionId, `not-a-project-${state.keyFingerprint(gitDir)}`, reason)
-        return skipped(reason)
-    }
+    const api = config && !dryRun ? new AmplifyApi({ ...config, orgId }, deps.fetchImpl) : null
 
     // Several unpushed commits share one pushed base, so findings are filtered
     // to lines added since the nearest ancestor whose check completed, looking
@@ -475,23 +519,30 @@ async function commitPrelude(
 
 /**
  * The synchronous companion of the commit hook: tell the user a check is
- * starting, or why this commit gets none. It computes the same offline verdict
- * as `runCommitCheck`, so the two never disagree about which it is, and it is
- * the one that records a skipped commit. Always exits 0; a synchronous hook's
- * `systemMessage` is shown directly.
+ * starting, or why this commit gets none. It computes the same verdict as
+ * `runCommitCheck` (with short lookup timeouts), so the two never disagree
+ * about which it is, and it is the one that records a skipped commit. Always
+ * exits 0; a synchronous hook's `systemMessage` is shown directly.
  */
-export async function announceCommitCheck(input: HookInput, deps: Pick<CommitCheckDeps, "env" | "now"> = {}): Promise<number> {
+export async function announceCommitCheck(input: HookInput, deps: Pick<CommitCheckDeps, "env" | "now" | "fetchImpl"> = {}): Promise<number> {
     const env = deps.env ?? process.env
     const dataDir = state.dataDir(env)
     const log = (message: string) => state.log(dataDir, `[${input.session_id}] ${message}`)
-    const verdict = await offlineVerdict(input, env, dataDir, log, deps.now)
+    const verdict = await commitVerdict(input, dataDir, log, deps, ANNOUNCE_LOOKUP_TIMEOUT_MS)
     if (verdict.kind === "ignore") return EXIT_OK
+    if (verdict.kind === "unresolved") {
+        // Whether a check will run is unknown, so nothing is promised. The background
+        // hook, with more time, delivers the outcome either way.
+        log(`${verdict.head}: could not tell whether a check will run; not announcing`)
+        return EXIT_OK
+    }
 
     let message: string
     if (verdict.kind === "skip") {
         // This hook owns the skip: it reports it, so it also records it. Whichever
         // order the two hooks run in, the background hook then stays quiet.
         if (verdict.record) state.appendCheckedSha(verdict.gitDir, verdict.head, verdict.record)
+        if (verdict.remember) state.rememberProblem(dataDir, input.session_id, verdict.remember.key, verdict.remember.reason)
         message = verdict.message
     } else {
         const short = verdict.plan.head.slice(0, 7)
