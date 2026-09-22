@@ -14,14 +14,18 @@ Each time Claude commits in a repository that is onboarded in Amplify, the plugi
 3. Wakes Claude with the results one to two minutes later. Claude fixes valid findings in place and
    explains any it disagrees with, then carries on with what you asked.
 
-A commit with no findings produces no interruption. The check never blocks or fails a commit, and it
-runs in the background so the session stays responsive.
+Every commit in an onboarded repository gets exactly one follow-up: the findings, a one-line
+"no findings", or a one-line reason the commit was not checked and what to do about it. In a
+repository that is not onboarded in your organization, or has no hosted `origin` remote, the plugin
+stays silent; the log records why. The check never blocks or fails a commit, and it runs in the
+background so the session stays responsive.
 
 ## Requirements
 
 - [Claude Code](https://code.claude.com) with plugins enabled.
 - [Bun](https://bun.sh). Install it with `curl -fsSL https://bun.sh/install | bash`. Without it the
-  plugin reminds you once a day and otherwise does nothing.
+  plugin tells you on each `git commit` that it was not checked (it cannot tell whether the commit
+  succeeded), and otherwise does nothing.
 - An Amplify API key for your user.
 - A repository that is onboarded as a project in your Amplify organization, with a hosted `origin`
   remote and at least one pushed commit. Amplify checks out the last pushed commit and applies your
@@ -34,20 +38,18 @@ claude plugin marketplace add amplify-security/console-claude-plugin
 claude plugin install console@amplify-security
 ```
 
-Then provide your API key, either inside Claude Code:
-
-```
-/plugin configure console@amplify-security
-```
-
-or on the command line:
+Claude Code asks for your API key when it enables the plugin. You can also pass it on the command line:
 
 ```sh
 claude plugin install console@amplify-security --config api_key=<your Amplify API key>
 ```
 
+The key is a sensitive setting, so it is kept in your system keychain and does not appear in
+`/plugin configure`; the other settings do.
+
 If your key belongs to exactly one Amplify organization, that is all. If it belongs to several, the
-plugin lists them by name and ID the first time it runs and asks you to set `org_id`.
+plugin lists them by name and ID the first time it runs and asks you to set `org_id`; commits are not
+checked until you do.
 
 Restart Claude Code after installing or changing configuration.
 
@@ -77,21 +79,34 @@ project's baseline findings in the Amplify Console.
 
 ## Troubleshooting
 
-Messages from the plugin start with "Amplify Console:" and are relayed by Claude. A configuration
-problem is reported once per session; a check that was skipped or failed is reported once per commit.
+Messages from the plugin start with "Amplify Console:" and are relayed by Claude. A commit that could
+not be checked says so on the commit itself, every time, with the reason and what to do; a check that
+started and failed is reported when it fails. A key that belongs to no or several organizations is
+reported once in full and then briefly on each later commit until you start a new Claude Code session.
 
-| Message                                    | Meaning                                                                                  |
-|--------------------------------------------|------------------------------------------------------------------------------------------|
-| "is not configured"                        | No API key. Run `/plugin configure console@amplify-security`.                           |
-| "cadence is set to"                        | Only `commit` is supported. Set `cadence` back to `commit` or clear it.                  |
-| "belongs to N organizations"               | Pick one from the list and set `org_id`.                                                 |
-| "is not onboarded as an Amplify project"   | The repository's `origin` URL does not match a project in your organization.              |
-| "no commit in this repository has been pushed yet" | Push at least once so Amplify has a base commit to check out.                    |
-| "could not reach Amplify"                  | Network or credential problem. The message includes the HTTP status.                     |
-| "Bun is not installed"                     | Install Bun (see Requirements).                                                          |
+A repository the plugin cannot check at all gets no message: one that is not onboarded as a project in
+your organization, or whose `origin` is not a hosted repository URL. Commits there are logged as not
+checked and nothing else happens. Onboard the repository, then start a new Claude Code session.
 
-A log of every run and every skipped commit is written to `log.txt` in the plugin's data directory,
-`~/.claude/plugins/data/console-amplify-security/`.
+| Message                                  | Meaning                                                                                       |
+|------------------------------------------|-----------------------------------------------------------------------------------------------|
+| "no findings in commit"                  | The check finished and your organization's detections reported nothing in the changed lines. |
+| "was not checked. The plugin is not configured" | No API key. Set `AMPLIFY_API_KEY` or reinstall with `--config api_key=…`, then start a new session. |
+| "was not checked. The plugin's cadence is set to" | Only `commit` is supported. Set `cadence` back to `commit` or clear it.              |
+| "Your API key belongs to N organizations" | Pick one from the list and set `org_id`, then start a new session.                          |
+| "Your organizations could not be looked up" | Amplify's account service was unreachable or rejected the key; retried on the next commit. Set `org_id` to skip the lookup. |
+| "could not be looked up in Amplify"      | The project lookup failed (network or key); retried on the next commit.                       |
+| "Nothing in this repository has been pushed yet" | Push at least once so Amplify has a base commit to check out.                       |
+| "has no changes Amplify can check"       | The commit is empty or changes only binary files.                                             |
+| "The unpushed changes now span" / "now exceed" | All unpushed changes together exceed 300 files or 1 MiB. Push to start a new range.    |
+| "the check for commit … failed"          | The run could not be started, finished, or read. The message says whether Amplify was unreachable, rejected the key, or errored; the commit's changes stay in scope for the next check. |
+| "The plugin hit an unexpected error"     | A bug in the plugin. The log has the stack trace.                                             |
+| "was not checked because Bun is not installed" | Install Bun (see Requirements).                                                         |
+
+Every message that mentions details points at the plugin log, `log.txt` in the plugin's data directory,
+`~/.claude/plugins/data/console-amplify-security/`. It records every run, every skipped commit, and the
+status behind each notice (HTTP status and error code, run ID). Quote the run ID when contacting Amplify
+support; the log never contains text sent by Amplify's servers.
 
 ## Contributing
 

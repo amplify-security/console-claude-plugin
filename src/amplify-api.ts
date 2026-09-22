@@ -32,8 +32,6 @@ export const TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "
 export interface Run {
     id: string
     status: RunStatus
-    /** Server-side failure text, set when status is "error". */
-    error: string | null
 }
 
 /** A finding row as served by GET /api/findings. `raw` is the SARIF-shaped payload. */
@@ -71,9 +69,11 @@ const POLL_TIMEOUT_MS = 45_000
 const MAX_FINDINGS_PAGES = 500
 
 export class AmplifyApi {
+    /** `requestTimeoutMs` bounds ordinary requests; the synchronous hook uses a short one so a slow network cannot hold up a commit. */
     constructor(
         private config: Config,
-        private fetchImpl: FetchLike = (url, init) => fetch(url, init)
+        private fetchImpl: FetchLike = (url, init) => fetch(url, init),
+        private requestTimeoutMs: number = REQUEST_TIMEOUT_MS
     ) {}
 
     /**
@@ -90,7 +90,7 @@ export class AmplifyApi {
         return run(controller.signal).finally(() => clearTimeout(timer))
     }
 
-    private request(method: string, path: string, body?: unknown, extraHeaders: Record<string, string> = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+    private request(method: string, path: string, body?: unknown, extraHeaders: Record<string, string> = {}, timeoutMs = this.requestTimeoutMs) {
         const headers: Record<string, string> = {
             Authorization: `Bearer ${this.config.apiKey}`,
             Accept: "application/json",
@@ -112,7 +112,7 @@ export class AmplifyApi {
 
     /** Organizations the API key's user belongs to, from the account service; needs no org. */
     async listMemberships(): Promise<Organization[]> {
-        const response = await this.withTimeout(REQUEST_TIMEOUT_MS, (signal) =>
+        const response = await this.withTimeout(this.requestTimeoutMs, (signal) =>
             this.fetchImpl(`${this.config.tenantUrl}/v1.1/user/memberships`, {
                 method: "GET",
                 headers: { "X-Amplify-Api-Key": this.config.apiKey, Accept: "application/json" },
@@ -132,7 +132,7 @@ export class AmplifyApi {
 
     /** Use this organization for every subsequent request. */
     withOrg(orgId: string): AmplifyApi {
-        return new AmplifyApi({ ...this.config, orgId }, this.fetchImpl)
+        return new AmplifyApi({ ...this.config, orgId }, this.fetchImpl, this.requestTimeoutMs)
     }
 
     /** Resolve the Amplify project for a repo clone URL; null when the repo is not onboarded. */
@@ -156,14 +156,16 @@ export class AmplifyApi {
             source: { baseSha: input.baseSha, diff: input.diff },
         })
         if (!isRecord(data) || typeof data.runId !== "string") throw new ApiError(202, undefined, "unexpected run shape")
-        return { id: data.runId, status: statusOf(data), error: null }
+        return { id: data.runId, status: statusOf(data) }
     }
 
     /** Long-poll a run: the server holds the request (at most 30s) until terminal or `waitSeconds` elapse. */
     async getRun(runId: string, waitSeconds: number): Promise<Run> {
         const data = await this.request("GET", `/api/runs/${encodeURIComponent(runId)}?wait=${waitSeconds}`, undefined, {}, POLL_TIMEOUT_MS)
         if (!isRecord(data) || typeof data.status !== "string") throw new ApiError(200, undefined, "unexpected run shape")
-        return { id: runId, status: statusOf(data), error: typeof data.error === "string" ? data.error : null }
+        // The response also carries `error`, the server's failure text. It is not read: it can name
+        // infrastructure, and nothing the plugin writes (notice or log) may repeat text a server sent.
+        return { id: runId, status: statusOf(data) }
     }
 
     async listFindings(runId: string): Promise<Finding[]> {

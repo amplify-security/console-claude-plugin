@@ -5,7 +5,8 @@ import { join } from "node:path"
 import {
     appendCheckedSha,
     dataDir,
-    firstTimeThisSession,
+    rememberProblem,
+    rememberedProblem,
     readCheckedShas,
     readRepoCache,
     writeOrgCache,
@@ -20,12 +21,13 @@ describe("state", () => {
         expect(dataDir({})).toContain("console")
     })
 
-    test("firstTimeThisSession is true once per session and key", () => {
+    test("a remembered problem is scoped to its session and key, and reads back its reason", () => {
         const dir = tmp()
-        expect(firstTimeThisSession(dir, "s1", "unconfigured")).toBe(true)
-        expect(firstTimeThisSession(dir, "s1", "unconfigured")).toBe(false)
-        expect(firstTimeThisSession(dir, "s1", "other")).toBe(true)
-        expect(firstTimeThisSession(dir, "s2", "unconfigured")).toBe(true)
+        expect(rememberedProblem(dir, "s1", "org-unresolved")).toBeNull()
+        rememberProblem(dir, "s1", "org-unresolved", "Your API key belongs to no organization.")
+        expect(rememberedProblem(dir, "s1", "org-unresolved")).toBe("Your API key belongs to no organization.")
+        expect(rememberedProblem(dir, "s1", "other")).toBeNull()
+        expect(rememberedProblem(dir, "s2", "org-unresolved")).toBeNull()
     })
 
     test("checked shas round-trip and cap at 500", () => {

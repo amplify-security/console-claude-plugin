@@ -34,7 +34,7 @@ describe("AmplifyApi", () => {
     test("submitRun posts the diff source and reads the returned status", async () => {
         const { calls, api } = fakeFetch(() => json({ runId: "run_1", status: "running", deduped: true }, 202))
         const run = await api.submitRun({ projectId: "p1", baseSha: "abc", diff: "diff --git" })
-        expect(run).toEqual({ id: "run_1", status: "running", error: null })
+        expect(run).toEqual({ id: "run_1", status: "running" })
         expect(calls[0]!.url).toBe("https://api.test/api/runs")
         expect(calls[0]!.init.method).toBe("POST")
         expect(JSON.parse(calls[0]!.init.body as string)).toEqual({
@@ -47,7 +47,8 @@ describe("AmplifyApi", () => {
 
     test("getRun long-polls with the wait parameter", async () => {
         const { calls, api } = fakeFetch(() => json({ id: "run_1", status: "error", error: "git apply failed" }))
-        expect(await api.getRun("run_1", 30)).toEqual({ id: "run_1", status: "error", error: "git apply failed" })
+        // The server's error text is deliberately not read: nothing the plugin writes may repeat it.
+        expect(await api.getRun("run_1", 30)).toEqual({ id: "run_1", status: "error" })
         expect(calls[0]!.url).toBe("https://api.test/api/runs/run_1?wait=30")
         // A hung connection must not tie up the run indefinitely: bounded by a client-side abort, longer than the server's poll wait.
         expect(calls[0]!.init.signal).toBeInstanceOf(AbortSignal)

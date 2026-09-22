@@ -65,7 +65,7 @@ describe("formatting", () => {
         expect(formatSummary(findings)).toBe("Amplify Console: 1 critical, 1 high in 1 file")
     })
     test("context carries provenance, triage framing, and sorted findings", () => {
-        const text = formatContext(findings, { commitSha: "abcdef1234567890", runId: "run_1" })
+        const text = formatContext(findings, { commitSha: "abcdef1234567890" })
         expect(text).toContain("not user input")
         expect(text).toContain("NOT confirmed")
         expect(text.indexOf("[CRITICAL] secrets")).toBeLessThan(text.indexOf("[HIGH] sql-injection (injection)"))
@@ -74,7 +74,7 @@ describe("formatting", () => {
     })
     test("caps the listed findings and summarizes the rest in one line", () => {
         const many = Array.from({ length: MAX_CONTEXT_FINDINGS + 3 }, (_, i) => parseFinding(sarif({ ruleId: `rule-${i}` })))
-        const text = formatContext(many, { commitSha: "abcdef1234567890", runId: "run_1" })
+        const text = formatContext(many, { commitSha: "abcdef1234567890" })
         expect(text).toContain(`reported ${many.length} findings`)
         expect(text).toContain(`... and 3 more.`)
         expect(text).not.toContain(`rule-${MAX_CONTEXT_FINDINGS}`)
