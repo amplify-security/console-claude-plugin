@@ -249,8 +249,9 @@ export async function runCommitCheck(input: HookInput, deps: CommitCheckDeps = {
     const verdict = await offlineVerdict(input, env, dataDir, log, deps.now)
     if (verdict.kind === "ignore") return EXIT_OK
     if (verdict.kind === "skip") {
-        // The synchronous hook reached the same verdict and has told the user.
-        if (verdict.record) state.appendCheckedSha(verdict.gitDir, verdict.head, verdict.record)
+        // The synchronous hook reached the same verdict, told the user, and recorded
+        // the commit. Recording it here too would race that hook's read of the
+        // checked-commits file and could make it fall silent.
         log(`${verdict.head}: ${verdict.message}`)
         return EXIT_OK
     }
@@ -475,8 +476,9 @@ async function commitPrelude(
 /**
  * The synchronous companion of the commit hook: tell the user a check is
  * starting, or why this commit gets none. It computes the same offline verdict
- * as `runCommitCheck`, so the two never disagree about which it is. Always
- * exits 0; a synchronous hook's `systemMessage` is shown directly.
+ * as `runCommitCheck`, so the two never disagree about which it is, and it is
+ * the one that records a skipped commit. Always exits 0; a synchronous hook's
+ * `systemMessage` is shown directly.
  */
 export async function announceCommitCheck(input: HookInput, deps: Pick<CommitCheckDeps, "env" | "now"> = {}): Promise<number> {
     const env = deps.env ?? process.env
@@ -487,6 +489,9 @@ export async function announceCommitCheck(input: HookInput, deps: Pick<CommitChe
 
     let message: string
     if (verdict.kind === "skip") {
+        // This hook owns the skip: it reports it, so it also records it. Whichever
+        // order the two hooks run in, the background hook then stays quiet.
+        if (verdict.record) state.appendCheckedSha(verdict.gitDir, verdict.head, verdict.record)
         message = verdict.message
     } else {
         const short = verdict.plan.head.slice(0, 7)
@@ -542,7 +547,8 @@ async function resolveOrg(api: AmplifyApi, config: Config, dataDir: string, log:
         orgs = await api.listMemberships()
     } catch (err) {
         log(`listing organizations from ${config.tenantUrl} failed: ${describe(err)}`)
-        const reason = `Your organizations could not be looked up. ${explain(err)} ${configure}`
+        // Retried on the next commit, so no restart is asked for; org_id merely skips the lookup.
+        const reason = `Your organizations could not be looked up. ${explain(err)} Setting org_id in the plugin configuration skips this lookup.`
         return { ok: false, kind: "failed", message: `${reason} ${detailsIn(dataDir)}`, reason }
     }
     if (orgs.length === 1) {

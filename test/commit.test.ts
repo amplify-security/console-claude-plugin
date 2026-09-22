@@ -293,10 +293,25 @@ describe("runCommitCheck", () => {
         const dataDir = tmp()
         const start = await capture(() => announceCommitCheck(input(repo.work, head), { env: env(dataDir) }))
         expect(plain(shownBy(start.out))).toContain(`commit ${head.slice(0, 7)} has no changes Amplify can check`)
+        // The synchronous hook records the skip, so the background hook stays quiet in either order.
+        expect(readCheckedShas(join(repo.work, ".git")).completed.has(head)).toBe(true)
         const server = fakeServer()
         expect(await capture(() => runCommitCheck(input(repo.work, head), { env: env(dataDir), fetchImpl: server.fetchImpl, ...fast }))).toEqual({ result: 0, out: "" })
         expect(server.calls).toHaveLength(0)
-        expect(readCheckedShas(join(repo.work, ".git")).completed.has(head)).toBe(true)
+    })
+
+    test("a skipped commit is recorded by the synchronous hook only, so the background hook can never make it fall silent", async () => {
+        const repo = fixtureRepo()
+        const many = Object.fromEntries(Array.from({ length: MAX_DIFF_FILES + 1 }, (_, i) => [`gen/f${i}.ts`, `${i}\n`]))
+        const head = repo.commit(many, "huge")
+        const dataDir = tmp()
+        // Background hook first: it must not record the commit...
+        expect(await capture(() => runCommitCheck(input(repo.work, head), { env: env(dataDir), fetchImpl: fakeServer().fetchImpl, ...fast }))).toEqual({ result: 0, out: "" })
+        expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(false)
+        // ...so the synchronous hook still reports it, and it is the one that records it.
+        const start = await capture(() => announceCommitCheck(input(repo.work, head), { env: env(dataDir) }))
+        expect(plain(shownBy(start.out))).toContain(`commit ${head.slice(0, 7)} was not checked`)
+        expect(readCheckedShas(join(repo.work, ".git")).all.has(head)).toBe(true)
     })
 
     test("ignores non-commit commands, including plumbing subcommands like commit-tree", async () => {

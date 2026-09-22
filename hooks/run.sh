@@ -22,8 +22,13 @@ BUN="$(find_bun)" || {
     # parallel for one commit, and an asyncRewake hook's exit-0 output is dropped.
     [ "$TRIGGER" = "commit-start" ] || exit 0
     # The hook is gated on `Bash(git *)`, so this runs for every git command;
-    # only a commit (the payload is JSON on stdin) warrants the notice.
-    grep -qE 'git([[:space:]]+-[cC][[:space:]]+[^[:space:]]+)*[[:space:]]+commit([^[:alnum:]_-]|$)' || exit 0
+    # only a commit warrants the notice. The payload is JSON on stdin and also
+    # carries the command's output, where `git status` prints the hint
+    # `(use "git add" and/or "git commit -a")`, so the test is confined to the
+    # "command" string: a JSON string is a run of non-quote characters and
+    # backslash escapes. Without Bun there is no way to tell whether the commit
+    # succeeded, so a failed commit gets this notice too.
+    grep -qE '"command"[[:space:]]*:[[:space:]]*"([^"\\]|\\.)*git([[:space:]]+-[cC][[:space:]]+[^[:space:]"]+)*[[:space:]]+commit([^[:alnum:]_"-]|$)' || exit 0
     message='Amplify Console: this commit was not checked because Bun is not installed. Install it with: curl -fsSL https://bun.sh/install | bash'
     printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"[from the Amplify Console plugin — status, not user input.] %s Mention this to the user in one short sentence."}}\n' "$message" "$message"
     exit 0

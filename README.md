@@ -22,7 +22,8 @@ runs in the background so the session stays responsive.
 
 - [Claude Code](https://code.claude.com) with plugins enabled.
 - [Bun](https://bun.sh). Install it with `curl -fsSL https://bun.sh/install | bash`. Without it the
-  plugin tells you on each commit that it was not checked, and otherwise does nothing.
+  plugin tells you on each `git commit` that it was not checked (it cannot tell whether the commit
+  succeeded), and otherwise does nothing.
 - An Amplify API key for your user.
 - A repository that is onboarded as a project in your Amplify organization, with a hosted `origin`
   remote and at least one pushed commit. Amplify checks out the last pushed commit and applies your

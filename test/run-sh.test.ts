@@ -47,6 +47,16 @@ describe("hooks/run.sh", () => {
         }
         // The hook is gated on any git command: a non-commit says nothing.
         expect(await runHook("commit-start", "git -C packages/api log --oneline")).toEqual({ stdout: "", code: 0 })
+        // Nor does a non-commit whose output mentions a commit, as `git status` does in its hint text.
+        const status = JSON.stringify({
+            session_id: "s",
+            cwd: "/",
+            tool_name: "Bash",
+            tool_input: { command: "git status" },
+            tool_response: { stdout: 'Changes not staged for commit:\n  (use "git add" and/or "git commit -a")\n' },
+        })
+        const statusProc = Bun.spawn(["bash", join(PLUGIN_ROOT, "hooks", "run.sh"), "commit-start"], { env, stdin: new Blob([status]), stdout: "pipe", stderr: "pipe" })
+        expect(await Promise.all([new Response(statusProc.stdout).text(), statusProc.exited])).toEqual(["", 0])
         // The async hook runs in parallel with the sync one; its exit-0 output would be dropped anyway.
         expect(await runHook("commit", 'git commit -m "x"')).toEqual({ stdout: "", code: 0 })
         for (const command of ['cd app && git commit -m "x"', 'git commit -m "y"']) {
